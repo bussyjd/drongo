@@ -204,6 +204,49 @@ public class Keystore extends Persistable {
         return publicKey;
     }
 
+    /** Encode the public key cache for persistence: version byte, then per chain [purpose ordinal, uint16 count, count x 1312-byte keys]. */
+    public byte[] encodeBtqPublicKeyCache() {
+        if(btqPublicKeyCache.isEmpty()) {
+            return null;
+        }
+        java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream();
+        out.write(1);
+        for(Map.Entry<KeyPurpose, List<byte[]>> entry : btqPublicKeyCache.entrySet()) {
+            List<byte[]> keys = entry.getValue().stream().filter(Objects::nonNull).toList();
+            out.write(entry.getKey().ordinal());
+            out.write((keys.size() >> 8) & 0xff);
+            out.write(keys.size() & 0xff);
+            for(byte[] publicKey : keys) {
+                out.writeBytes(publicKey);
+            }
+        }
+        return out.toByteArray();
+    }
+
+    /** Restore the public key cache from its persisted encoding. Unknown versions are ignored. */
+    public void decodeBtqPublicKeyCache(byte[] encoded) {
+        if(encoded == null || encoded.length < 1 || encoded[0] != 1) {
+            return;
+        }
+        int offset = 1;
+        while(offset + 3 <= encoded.length) {
+            KeyPurpose keyPurpose = KeyPurpose.values()[encoded[offset] & 0xff];
+            int count = ((encoded[offset + 1] & 0xff) << 8) | (encoded[offset + 2] & 0xff);
+            offset += 3;
+            List<byte[]> cache = btqPublicKeyCache.computeIfAbsent(keyPurpose, purpose -> new ArrayList<>());
+            for(int keyIndex = 0; keyIndex < count && offset + 1312 <= encoded.length; keyIndex++) {
+                byte[] publicKey = Arrays.copyOfRange(encoded, offset, offset + 1312);
+                offset += 1312;
+                while(cache.size() <= keyIndex) {
+                    cache.add(null);
+                }
+                if(cache.get(keyIndex) == null) {
+                    cache.set(keyIndex, publicKey);
+                }
+            }
+        }
+    }
+
     /** The 32-byte ML-DSA key seed for a BTQ wallet node, for signing. The caller must zeroize it after use. */
     public byte[] getBtqKeySeed(KeyPurpose keyPurpose, int keyIndex) {
         if(btqMasterSecret == null || btqMasterSecret.isEncrypted()) {
@@ -635,6 +678,9 @@ public class Keystore extends Persistable {
             masterPrivateExtendedKey = masterPrivateExtendedKey.encrypt(key);
         }
         if(hasBtqMasterSecret() && !btqMasterSecret.isEncrypted()) {
+            //Last moment the secret is available: ensure the public key cache covers the gap window so
+            //addresses stay displayable while encrypted, regardless of how this keystore was assembled
+            warmBtqPublicKeyCache(Network.get(), BTQ_CACHE_WARM_INDEXES);
             btqMasterSecret = btqMasterSecret.encrypt(key);
         }
     }
