@@ -7,6 +7,7 @@ public class Miniscript {
     private static final Pattern KEYHASH_PATTERN = Pattern.compile("pkh?\\(");
     private static final Pattern TAPROOT_PATTERN = Pattern.compile("tr\\(");
     private static final Pattern SILENT_PAYMENTS_PATTERN = Pattern.compile("sp\\(");
+    private static final Pattern P2MR_PATTERN = Pattern.compile("^p2mr\\(");
     private static final Pattern MULTI_PATTERN = Pattern.compile("multi\\((\\d+)");
 
     private String script;
@@ -36,6 +37,12 @@ public class Miniscript {
 
         Matcher silentPaymentsMatcher = SILENT_PAYMENTS_PATTERN.matcher(script);
         if(silentPaymentsMatcher.find()) {
+            return 1;
+        }
+
+        Matcher p2mrMatcher = P2MR_PATTERN.matcher(script);
+        if(p2mrMatcher.find()) {
+            //Bitcoin Quantum single-key P2MR custody
             return 1;
         }
 
