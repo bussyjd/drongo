@@ -2,6 +2,7 @@ package com.sparrowwallet.drongo.psbt;
 
 import com.sparrowwallet.drongo.KeyDerivation;
 import com.sparrowwallet.drongo.Utils;
+import com.sparrowwallet.drongo.btq.Mldsa44;
 import com.sparrowwallet.drongo.crypto.ECKey;
 import com.sparrowwallet.drongo.protocol.*;
 import com.sparrowwallet.drongo.silentpayments.SilentPaymentsDLEQProof;
@@ -43,6 +44,11 @@ public class PSBTInput {
     public static final byte PSBT_IN_SP_DLEQ = 0x1e;
     public static final byte PSBT_IN_SP_SPEND_BIP32_DERIVATION = 0x1f;
     public static final byte PSBT_IN_SP_TWEAK = 0x20;
+
+    //Bitcoin Quantum P2MR (BIP360) input fields: leaf script (+control block key), merkle root, Dilithium script sig
+    public static final byte PSBT_IN_P2MR_LEAF_SCRIPT = 0x19;
+    public static final byte PSBT_IN_P2MR_MERKLE_ROOT = 0x1a;
+    public static final byte PSBT_IN_P2MR_DILITHIUM_SCRIPT_SIG = 0x1b;
     public static final byte PSBT_IN_PROPRIETARY = (byte)0xfc;
 
     private final PSBT psbt;
@@ -64,6 +70,15 @@ public class PSBTInput {
     private TransactionSignature tapKeyPathSignature;
     private Map<ECKey, Map<KeyDerivation, List<Sha256Hash>>> tapDerivedPublicKeys = new LinkedHashMap<>();
     private ECKey tapInternalKey;
+
+    //Bitcoin Quantum P2MR (BIP360) fields
+    private byte[] p2mrLeafScript;          //the leaf script (0x19 value minus the trailing leaf-version byte)
+    private byte p2mrLeafVersion;           //the leaf version (0x19 value trailing byte, 0xc0)
+    private byte[] p2mrControlBlock;        //the control block (0x19 key data, e.g. [0xc1])
+    private byte[] p2mrMerkleRoot;          //the 32-byte script-tree merkle root (0x1a value)
+    private byte[] p2mrDilithiumPubKey;     //the 1312-byte ML-DSA public key (0x1b key data, bytes 0..1312)
+    private byte[] p2mrDilithiumLeafHash;   //the 32-byte leaf hash (0x1b key data, bytes 1312..1344)
+    private byte[] p2mrDilithiumSignature;  //the ML-DSA transaction signature (0x1b value)
 
     //PSBTv2-only fields
     private Sha256Hash prevTxid;
@@ -372,6 +387,37 @@ public class PSBTInput {
                     this.tapInternalKey = ECKey.fromPublicOnly(entry.getData());
                     log.debug("Found input taproot internal key " + Utils.bytesToHex(entry.getData()));
                     break;
+                case PSBT_IN_P2MR_LEAF_SCRIPT:
+                    byte[] leafValue = entry.getData();
+                    if(leafValue.length < 1) {
+                        throw new PSBTParseException("PSBT input P2MR leaf script entry must contain at least the leaf version byte");
+                    }
+                    this.p2mrControlBlock = entry.getKeyData();
+                    this.p2mrLeafScript = Arrays.copyOf(leafValue, leafValue.length - 1);
+                    this.p2mrLeafVersion = leafValue[leafValue.length - 1];
+                    log.debug("Found input P2MR leaf script");
+                    break;
+                case PSBT_IN_P2MR_MERKLE_ROOT:
+                    entry.checkOneByteKey();
+                    if(entry.getData().length != 32) {
+                        throw new PSBTParseException("PSBT input P2MR merkle root must be 32 bytes");
+                    }
+                    this.p2mrMerkleRoot = entry.getData();
+                    log.debug("Found input P2MR merkle root");
+                    break;
+                case PSBT_IN_P2MR_DILITHIUM_SCRIPT_SIG:
+                    byte[] sigKeyData = entry.getKeyData();
+                    if(sigKeyData == null || sigKeyData.length != Mldsa44.PUBLIC_KEY_BYTES + 32) {
+                        throw new PSBTParseException("PSBT input P2MR Dilithium script sig key must be a 1312-byte public key plus 32-byte leaf hash");
+                    }
+                    if(entry.getData().length != Mldsa44.TRANSACTION_SIGNATURE_BYTES) {
+                        throw new PSBTParseException("PSBT input P2MR Dilithium signature must be " + Mldsa44.TRANSACTION_SIGNATURE_BYTES + " bytes");
+                    }
+                    this.p2mrDilithiumPubKey = Arrays.copyOfRange(sigKeyData, 0, Mldsa44.PUBLIC_KEY_BYTES);
+                    this.p2mrDilithiumLeafHash = Arrays.copyOfRange(sigKeyData, Mldsa44.PUBLIC_KEY_BYTES, sigKeyData.length);
+                    this.p2mrDilithiumSignature = entry.getData();
+                    log.debug("Found input P2MR Dilithium script signature");
+                    break;
                 default:
                     log.warn("PSBT input not recognized key type: " + entry.getKeyType());
             }
@@ -546,6 +592,23 @@ public class PSBTInput {
             entries.add(populateEntry(PSBT_IN_TAP_INTERNAL_KEY, null, tapInternalKey.getPubKeyXCoord()));
         }
 
+        if(p2mrLeafScript != null) {
+            byte[] leafValue = Arrays.copyOf(p2mrLeafScript, p2mrLeafScript.length + 1);
+            leafValue[leafValue.length - 1] = p2mrLeafVersion;
+            entries.add(populateEntry(PSBT_IN_P2MR_LEAF_SCRIPT, p2mrControlBlock, leafValue));
+        }
+
+        if(p2mrMerkleRoot != null) {
+            entries.add(populateEntry(PSBT_IN_P2MR_MERKLE_ROOT, null, p2mrMerkleRoot));
+        }
+
+        if(p2mrDilithiumSignature != null) {
+            byte[] sigKey = new byte[p2mrDilithiumPubKey.length + p2mrDilithiumLeafHash.length];
+            System.arraycopy(p2mrDilithiumPubKey, 0, sigKey, 0, p2mrDilithiumPubKey.length);
+            System.arraycopy(p2mrDilithiumLeafHash, 0, sigKey, p2mrDilithiumPubKey.length, p2mrDilithiumLeafHash.length);
+            entries.add(populateEntry(PSBT_IN_P2MR_DILITHIUM_SCRIPT_SIG, sigKey, p2mrDilithiumSignature));
+        }
+
         return entries;
     }
 
@@ -633,6 +696,22 @@ public class PSBTInput {
 
         if(psbtInput.tapInternalKey != null) {
             tapInternalKey = psbtInput.tapInternalKey;
+        }
+
+        if(psbtInput.p2mrLeafScript != null) {
+            p2mrLeafScript = psbtInput.p2mrLeafScript;
+            p2mrLeafVersion = psbtInput.p2mrLeafVersion;
+            p2mrControlBlock = psbtInput.p2mrControlBlock;
+        }
+
+        if(psbtInput.p2mrMerkleRoot != null) {
+            p2mrMerkleRoot = psbtInput.p2mrMerkleRoot;
+        }
+
+        if(psbtInput.p2mrDilithiumSignature != null) {
+            p2mrDilithiumPubKey = psbtInput.p2mrDilithiumPubKey;
+            p2mrDilithiumLeafHash = psbtInput.p2mrDilithiumLeafHash;
+            p2mrDilithiumSignature = psbtInput.p2mrDilithiumSignature;
         }
     }
 
@@ -752,6 +831,52 @@ public class PSBTInput {
 
     public void setTapInternalKey(ECKey tapInternalKey) {
         this.tapInternalKey = tapInternalKey;
+    }
+
+    public byte[] getP2mrLeafScript() {
+        return p2mrLeafScript;
+    }
+
+    public byte getP2mrLeafVersion() {
+        return p2mrLeafVersion;
+    }
+
+    public byte[] getP2mrControlBlock() {
+        return p2mrControlBlock;
+    }
+
+    /** Set the P2MR leaf script, its leaf version and control block together (BIP360 field 0x19). */
+    public void setP2mrLeaf(byte[] leafScript, byte leafVersion, byte[] controlBlock) {
+        this.p2mrLeafScript = leafScript;
+        this.p2mrLeafVersion = leafVersion;
+        this.p2mrControlBlock = controlBlock;
+    }
+
+    public byte[] getP2mrMerkleRoot() {
+        return p2mrMerkleRoot;
+    }
+
+    public void setP2mrMerkleRoot(byte[] p2mrMerkleRoot) {
+        this.p2mrMerkleRoot = p2mrMerkleRoot;
+    }
+
+    public byte[] getP2mrDilithiumPubKey() {
+        return p2mrDilithiumPubKey;
+    }
+
+    public byte[] getP2mrDilithiumLeafHash() {
+        return p2mrDilithiumLeafHash;
+    }
+
+    public byte[] getP2mrDilithiumSignature() {
+        return p2mrDilithiumSignature;
+    }
+
+    /** Set the P2MR Dilithium script signature: the ML-DSA public key, its committed leaf hash and the signature (BIP360 field 0x1b). */
+    public void setP2mrDilithiumSignature(byte[] publicKey, byte[] leafHash, byte[] signature) {
+        this.p2mrDilithiumPubKey = publicKey;
+        this.p2mrDilithiumLeafHash = leafHash;
+        this.p2mrDilithiumSignature = signature;
     }
 
     public boolean isTaproot() {
