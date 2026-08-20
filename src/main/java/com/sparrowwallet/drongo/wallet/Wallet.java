@@ -1040,7 +1040,22 @@ public class Wallet extends Persistable implements Comparable<Wallet> {
      *
      * @return the number of vBytes
      */
+    /** The virtual size of a constructed transaction, honouring Bitcoin Quantum's witness scale factor of 16. */
+    private double getVirtualSize(Transaction transaction) {
+        if(policyType == PolicyType.SINGLE_MLDSA) {
+            //BTQ weight = stripped_size * 15 + total_size; vsize = weight / 16
+            int totalSize = transaction.bitcoinSerialize().length;
+            int strippedSize = transaction.bitcoinSerialize(false).length;
+            return Math.ceil((strippedSize * 15d + totalSize) / 16d);
+        }
+        return transaction.getVirtualSize();
+    }
+
     public int getInputVbytes() {
+        if(policyType == PolicyType.SINGLE_MLDSA) {
+            //BTQ single-key P2MR: 4402 WU at Bitcoin Quantum's witness scale factor of 16
+            return (int)Math.ceil(4402d / 16);
+        }
         return (int)Math.ceil((double)getInputWeightUnits() / (double)WITNESS_SCALE_FACTOR);
     }
 
@@ -1050,6 +1065,11 @@ public class Wallet extends Persistable implements Comparable<Wallet> {
      * @return the number of weight units (WU)
      */
     public int getInputWeightUnits() {
+        if(policyType == PolicyType.SINGLE_MLDSA) {
+            //41 non-witness bytes at 16x plus the maximum single-key P2MR witness (~3746 bytes)
+            return 4402;
+        }
+
         //Estimate assuming an input spending from the parent receive node - it does not matter this node has no real utxos
         WalletNode receiveNode = new WalletNode(this, KeyPurpose.RECEIVE);
 
@@ -1174,7 +1194,7 @@ public class Wallet extends Persistable implements Comparable<Wallet> {
                 outputs.add(new WalletTransaction.NonAddressOutput(output));
             }
 
-            double noChangeVSize = transaction.getVirtualSize();
+            double noChangeVSize = getVirtualSize(transaction);
             long noChangeFeeRequiredAmt = params.getRequiredFeeAmount(noChangeVSize);
 
             //Add 1 satoshi to accommodate longer signatures when feeRate equals the current or common min relay fee to ensure fee is sufficient for maximum "relayability"
@@ -1212,12 +1232,12 @@ public class Wallet extends Persistable implements Comparable<Wallet> {
 
             //Determine if a change output is required by checking if its value exceeds both the cost of change and the relay dust threshold
             List<Long> setChangeAmts = getSetChangeAmounts(selectedUtxoSets, totalPaymentAmount, noChangeFeeRequiredAmt);
-            double noChangeFeeRate = (params.fee() == null ? params.feeRate() : noChangeFeeRequiredAmt / transaction.getVirtualSize());
+            double noChangeFeeRate = (params.fee() == null ? params.feeRate() : noChangeFeeRequiredAmt / getVirtualSize(transaction));
             TransactionOutput changeOutput = new TransactionOutput(transaction, setChangeAmts.getFirst(), getNode(KeyPurpose.CHANGE).getOutputScript());
             long costOfChangeAmt = getCostOfChange(noChangeFeeRate, params.longTermFeeRate());
             long dustThresholdAmt = getDustThreshold(changeOutput, Transaction.DUST_RELAY_TX_FEE);
             long minChangeAmt = Math.max(costOfChangeAmt, dustThresholdAmt);
-            if(setChangeAmts.stream().allMatch(amt -> amt > minChangeAmt) || (numSets > 1 && differenceAmt / transaction.getVirtualSize() > noChangeFeeRate * 2)) {
+            if(setChangeAmts.stream().allMatch(amt -> amt > minChangeAmt) || (numSets > 1 && differenceAmt / getVirtualSize(transaction) > noChangeFeeRate * 2)) {
                 //Change output is required, determine new fee once change output has been added
                 double changeVSize = noChangeVSize + changeOutput.getLength() * numSets;
                 long changeFeeRequiredAmt = params.getRequiredFeeAmount(changeVSize);
@@ -1253,7 +1273,7 @@ public class Wallet extends Persistable implements Comparable<Wallet> {
 
                 if(setChangeAmts.stream().anyMatch(amt -> amt < minChangeAmt)) {
                     //The new fee has meant that one of the change outputs is now dust. We pay too high a fee without change, but change is dust when added.
-                    if(numSets > 1 && differenceAmt / transaction.getVirtualSize() < noChangeFeeRate * 2) {
+                    if(numSets > 1 && differenceAmt / getVirtualSize(transaction) < noChangeFeeRate * 2) {
                         //Maximize privacy. Pay a higher fee to keep multiple output sets.
                         return new WalletTransaction(this, transaction, params.utxoSelectors(), selectedUtxoSets, txPayments, outputs, differenceAmt);
                     } else {
@@ -1316,6 +1336,16 @@ public class Wallet extends Persistable implements Comparable<Wallet> {
                 pubKeySignatures.put(pubKeys.get(i), i < threshold ? TransactionSignature.dummy(signingWallet.getScriptType().getSignatureType()) : null);
             }
             return signingWallet.getScriptType().addMultisigSpendingInput(signingWallet.getPolicyType(), transaction, prevTxOut, threshold, pubKeySignatures);
+        } else if(signingWallet.getPolicyType().equals(PolicyType.SINGLE_MLDSA)) {
+            //Dummy single-key P2MR spend: empty scriptSig plus the 3-push witness [signature, leafScript, controlBlock].
+            //Note serialization-based size estimates remain conservative for BTQ (drongo serializes witnesses at scale 4,
+            //BTQ discounts at scale 16); coin selection uses the wallet's explicit 4402 WU / 276 vB input constants.
+            byte[] mldsaPubKey = signingWallet.getKeystores().get(0).getBtqPublicKey(walletNode);
+            byte[] leafScript = com.sparrowwallet.drongo.btq.P2MR.singleKeyLeafScript(mldsaPubKey);
+            TransactionWitness dummyWitness = new TransactionWitness(transaction, List.of(
+                    new byte[com.sparrowwallet.drongo.btq.Mldsa44.TRANSACTION_SIGNATURE_BYTES], leafScript,
+                    com.sparrowwallet.drongo.btq.P2MR.singleLeafControlBlock()));
+            return transaction.addInput(prevTxOut.getHash(), prevTxOut.getIndex(), new Script(new byte[0]), dummyWitness);
         } else {
             throw new UnsupportedOperationException("Cannot create transaction for policy type " + signingWallet.getPolicyType());
         }
@@ -1487,7 +1517,7 @@ public class Wallet extends Persistable implements Comparable<Wallet> {
             transaction.addOutput(1L, address);
         }
 
-        long fee = (long)Math.floor(transaction.getVirtualSize() * feeRate);
+        long fee = (long)Math.floor(getVirtualSize(transaction) * feeRate);
         return maxInputValue - fee;
     }
 
