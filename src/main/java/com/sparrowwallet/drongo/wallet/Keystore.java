@@ -520,6 +520,9 @@ public class Keystore extends Persistable {
         if(btqMasterSecret != null) {
             copy.setBtqMasterSecret(btqMasterSecret.copy());
         }
+        for(Map.Entry<KeyPurpose, List<byte[]>> cacheEntry : btqPublicKeyCache.entrySet()) {
+            copy.btqPublicKeyCache.put(cacheEntry.getKey(), new ArrayList<>(cacheEntry.getValue()));
+        }
         if(externalPaymentCode != null) {
             copy.setExternalPaymentCode(externalPaymentCode.copy());
         }
@@ -564,7 +567,32 @@ public class Keystore extends Persistable {
         byte[] fingerprint = Arrays.copyOf(Sha256Hash.hash(receiveKey), 4);
         keystore.setKeyDerivation(new KeyDerivation(Utils.bytesToHex(fingerprint), "m/0'"));
 
+        keystore.warmBtqPublicKeyCache(network, BTQ_CACHE_WARM_INDEXES);
         return keystore;
+    }
+
+    /**
+     * Derive and cache the first ML-DSA public keys of both chains while the master secret is available.
+     * BTQ has no public derivation, so the cache is what keeps addresses displayable while the keystore
+     * is encrypted; it is carried through copies and re-warmed on decrypt.
+     */
+    public void warmBtqPublicKeyCache(Network network, int keysPerChain) {
+        if(btqMasterSecret == null || btqMasterSecret.isEncrypted()) {
+            return;
+        }
+        for(KeyPurpose keyPurpose : KeyPurpose.DEFAULT_PURPOSES) {
+            List<byte[]> cache = btqPublicKeyCache.computeIfAbsent(keyPurpose, purpose -> new ArrayList<>());
+            int target = Math.max(keysPerChain, cache.size());
+            for(int keyIndex = 0; keyIndex < target; keyIndex++) {
+                if(keyIndex >= cache.size() || cache.get(keyIndex) == null) {
+                    byte[] publicKey = BtqDerivation.derivePublicKey(btqMasterSecret.getSecret(), network, BtqDerivation.Chain.fromKeyPurpose(keyPurpose), keyIndex);
+                    while(cache.size() <= keyIndex) {
+                        cache.add(null);
+                    }
+                    cache.set(keyIndex, publicKey);
+                }
+            }
+        }
     }
 
     private static void rederiveKeystoreFromMaster(Keystore keystore, PolicyType policyType, List<ChildNumber> derivation) throws MnemonicException {
@@ -611,6 +639,9 @@ public class Keystore extends Persistable {
         }
     }
 
+    //Pre-derived ML-DSA public keys per chain, covering Sparrow's default gap limit
+    public static final int BTQ_CACHE_WARM_INDEXES = 21;
+
     public void decrypt(CharSequence password) {
         if(hasSeed() && seed.isEncrypted()) {
             seed = seed.decrypt(password);
@@ -620,6 +651,7 @@ public class Keystore extends Persistable {
         }
         if(hasBtqMasterSecret() && btqMasterSecret.isEncrypted()) {
             btqMasterSecret = btqMasterSecret.decrypt(password);
+            warmBtqPublicKeyCache(Network.get(), BTQ_CACHE_WARM_INDEXES);
         }
     }
 
@@ -632,6 +664,7 @@ public class Keystore extends Persistable {
         }
         if(hasBtqMasterSecret() && btqMasterSecret.isEncrypted()) {
             btqMasterSecret = btqMasterSecret.decrypt(key);
+            warmBtqPublicKeyCache(Network.get(), BTQ_CACHE_WARM_INDEXES);
         }
     }
 
