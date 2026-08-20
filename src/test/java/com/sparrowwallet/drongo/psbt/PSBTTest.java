@@ -873,6 +873,13 @@ public class PSBTTest {
     }
 
     @Test
+    public void invalidMixedSegwitVersions() {
+        //witness v2 is now a known type (BTQ P2MR), so an unknown version 3 witness program is used here
+        String psbt = "cHNidP8B+wQCAAAAAQIEAgAAAAEEBAEAAAABBQQBAAAAAQYBAwABDiCuv6p7LnQnsTi6F7UesBJ3TJOXBoHuPhb2Y3hjUklAJAEPBAAAAAABASughgEAAAAAACJTIIYiz2yIzTx5hSOFG+T1WYNgEYY+sDBYObtzXueh9KPpARAE/v///yIGA9NX98BxjyR44/2PjMwnKd3YwMyusfArGBpvRNQ7n42NAAEDBAEAAAAiHQLQKf+W3iy894K+Q1nEhiDqkrzda+8DK5UVi5GhaT+0+CECVRZOeSbVDVKgn/mQZHpelcHbG/xophb7wtohOSf5i/8iHgLQKf+W3iy894K+Q1nEhiDqkrzda+8DK5UVi5GhaT+0+EDB1n84eIK/gXkV6hWCHWTVs4NcH8BcVYzj2CSSoX2QjBBIfbub3cEIDIwtnBlxsmYIPGkFTiIZPyRBKKxmc35gAAEDCBhzAQAAAAAAAQQiUSAhnr95bXw7ml6Di0tr4pd8dOuNav5vT1iABrPWw2HrfAEJQgLQKf+W3iy894K+Q1nEhiDqkrzda+8DK5UVi5GhaT+0+AJNUYNT9L0Y12nPaP9i7xBmm3CGJGsKZAP+V73kkhFEiwA=";
+        Assertions.assertThrows(PSBTParseException.class, () -> PSBT.fromString(psbt));
+    }
+
+    @Test
     public void witnessVersionTwoP2mrUtxoParses() throws PSBTParseException {
         //A BTQ P2MR (BIP360) output is witness version 2: OP_2 <32-byte merkle root>. BTQ Core includes
         //such a witness UTXO in the PSBTs it builds for a watch-only P2MR input, with no other P2MR fields,
