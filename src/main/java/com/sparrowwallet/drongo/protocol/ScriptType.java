@@ -1369,7 +1369,7 @@ public enum ScriptType {
 
         @Override
         public List<PolicyType> getAllowedPolicyTypes() {
-            return Collections.emptyList();
+            return List.of(SINGLE_MLDSA);
         }
     };
 
@@ -1528,11 +1528,11 @@ public enum ScriptType {
 
     public static final ScriptType[] SINGLE_HASH_TYPES = {P2PKH, P2SH, P2SH_P2WPKH, P2SH_P2WSH, P2WPKH, P2WSH};
 
-    public static final ScriptType[] ADDRESSABLE_TYPES = {P2PKH, P2SH, P2SH_P2WPKH, P2SH_P2WSH, P2WPKH, P2WSH, P2TR, P2A};
+    public static final ScriptType[] ADDRESSABLE_TYPES = {P2PKH, P2SH, P2SH_P2WPKH, P2SH_P2WSH, P2WPKH, P2WSH, P2TR, P2A, P2MR};
 
     public static final ScriptType[] NON_WITNESS_TYPES = {P2PK, P2PKH, P2SH};
 
-    public static final ScriptType[] WITNESS_TYPES = {P2SH_P2WPKH, P2SH_P2WSH, P2WPKH, P2WSH, P2TR, P2A};
+    public static final ScriptType[] WITNESS_TYPES = {P2SH_P2WPKH, P2SH_P2WSH, P2WPKH, P2WSH, P2TR, P2A, P2MR};
 
     public static final byte[] ANCHOR_WITNESS_PROGRAM = new byte[] {78, 115};
 
@@ -1614,6 +1614,10 @@ public enum ScriptType {
             return (32 + 4 + 1 + ((double)66 / WITNESS_SCALE_FACTOR) + 4);
         } else if(P2A.equals(this)) {
             return 32 + 4 + 1 + 4;
+        } else if(P2MR.equals(this)) {
+            //Bitcoin Quantum single-key P2MR: ~3746 witness bytes (2421-byte ML-DSA sig + 1316-byte leaf
+            //+ control block) at BTQ's witness scale factor of 16 -> 4402 WU -> 275.125 vbytes
+            return (32 + 4 + 1 + ((double)3746 / 16) + 4);
         } else if(Arrays.asList(WITNESS_TYPES).contains(this)) {
             //Return length of spending input with 75% discount to script size
             return (32 + 4 + 1 + ((double)107 / WITNESS_SCALE_FACTOR) + 4);

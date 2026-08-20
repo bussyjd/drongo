@@ -723,6 +723,10 @@ public class Wallet extends Persistable implements Comparable<Wallet> {
     }
 
     public Address getAddress(WalletNode node) {
+        if(policyType == PolicyType.SINGLE_MLDSA) {
+            byte[] mldsaPubKey = getKeystores().get(0).getBtqPublicKey(node);
+            return com.sparrowwallet.drongo.btq.P2MR.addressForPublicKey(mldsaPubKey);
+        }
         if(policyType == PolicyType.SINGLE_HD || policyType == PolicyType.SINGLE_SP) {
             ECKey pubKey = node.getPubKey();
             return scriptType.getAddress(policyType, pubKey);
@@ -736,6 +740,10 @@ public class Wallet extends Persistable implements Comparable<Wallet> {
     }
 
     public Script getOutputScript(WalletNode node) {
+        if(policyType == PolicyType.SINGLE_MLDSA) {
+            byte[] mldsaPubKey = getKeystores().get(0).getBtqPublicKey(node);
+            return ScriptType.P2MR.getOutputScript(com.sparrowwallet.drongo.btq.P2MR.merkleRootForPublicKey(mldsaPubKey));
+        }
         if(policyType == PolicyType.SINGLE_HD || policyType == PolicyType.SINGLE_SP) {
             ECKey pubKey = node.getPubKey();
             return scriptType.getOutputScript(policyType, pubKey);
@@ -749,6 +757,10 @@ public class Wallet extends Persistable implements Comparable<Wallet> {
     }
 
     public String getOutputDescriptor(WalletNode node) {
+        if(policyType == PolicyType.SINGLE_MLDSA) {
+            //No standard descriptor exists for raw ML-DSA keys; BTQ Core imports P2MR addresses via addr()
+            return "addr(" + getAddress(node) + ")";
+        }
         if(policyType == PolicyType.SINGLE_HD || policyType == PolicyType.SINGLE_SP) {
             ECKey pubKey = node.getPubKey();
             return scriptType.getOutputDescriptor(pubKey);

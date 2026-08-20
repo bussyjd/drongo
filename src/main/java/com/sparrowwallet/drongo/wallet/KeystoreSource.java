@@ -5,7 +5,8 @@ public enum KeystoreSource {
     HW_AIRGAPPED("Airgapped Hardware Wallet"),
     SW_SEED("Software Wallet"),
     SW_WATCH("Watch Only Wallet"),
-    SW_PAYMENT_CODE("Payment Code Wallet");
+    SW_PAYMENT_CODE("Payment Code Wallet"),
+    SW_BTQ_SEED("Bitcoin Quantum Wallet");
 
     private final String displayName;
 
