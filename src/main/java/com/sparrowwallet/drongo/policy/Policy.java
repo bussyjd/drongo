@@ -62,6 +62,11 @@ public class Policy extends Persistable {
             return new Policy(new Miniscript("sp(" + keystores.get(0).getScriptName() + ")"));
         }
 
+        if(SINGLE_MLDSA.equals(policyType)) {
+            //Bitcoin Quantum single-key P2MR custody; there is no standard descriptor for raw ML-DSA keys
+            return new Policy(new Miniscript(scriptType.getDescriptor() + keystores.get(0).getScriptName() + scriptType.getCloseDescriptor()));
+        }
+
         throw new PolicyException("No standard policy for " + policyType + " policy with script type " + scriptType);
     }
 
