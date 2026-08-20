@@ -3,12 +3,16 @@ package com.sparrowwallet.drongo.wallet;
 import com.sparrowwallet.drongo.ExtendedKey;
 import com.sparrowwallet.drongo.KeyDerivation;
 import com.sparrowwallet.drongo.KeyPurpose;
+import com.sparrowwallet.drongo.Network;
 import com.sparrowwallet.drongo.Utils;
+import com.sparrowwallet.drongo.btq.BtqDerivation;
+import com.sparrowwallet.drongo.btq.Mldsa44;
 import com.sparrowwallet.drongo.bip47.PaymentAddress;
 import com.sparrowwallet.drongo.bip47.PaymentCode;
 import com.sparrowwallet.drongo.crypto.*;
 import com.sparrowwallet.drongo.policy.PolicyType;
 import com.sparrowwallet.drongo.protocol.ScriptType;
+import com.sparrowwallet.drongo.protocol.Sha256Hash;
 import com.sparrowwallet.drongo.silentpayments.SilentPaymentScanAddress;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -31,6 +35,11 @@ public class Keystore extends Persistable {
     private byte[] deviceRegistration;
     private MasterPrivateExtendedKey masterPrivateExtendedKey;
     private DeterministicSeed seed;
+
+    //Bitcoin Quantum custody: the 32-byte HKDF master secret and a cache of derived ML-DSA public keys.
+    //BTQ has no public derivation, so public keys can only be produced while the secret is decrypted.
+    private BtqMasterSecret btqMasterSecret;
+    private final Map<KeyPurpose, List<byte[]>> btqPublicKeyCache = new LinkedHashMap<>();
 
     //For BIP47 keystores - not persisted but must be unencrypted to generate keys
     private transient ExtendedKey bip47ExtendedPrivateKey;
@@ -149,12 +158,59 @@ public class Keystore extends Persistable {
         this.seed = seed;
     }
 
+    public boolean hasBtqMasterSecret() {
+        return btqMasterSecret != null;
+    }
+
+    public BtqMasterSecret getBtqMasterSecret() {
+        return btqMasterSecret;
+    }
+
+    public void setBtqMasterSecret(BtqMasterSecret btqMasterSecret) {
+        this.btqMasterSecret = btqMasterSecret;
+    }
+
     public boolean hasMasterPrivateKey() {
         return hasSeed() || hasMasterPrivateExtendedKey();
     }
 
     public boolean hasPrivateKey() {
-        return hasMasterPrivateKey() || (source == KeystoreSource.SW_PAYMENT_CODE && bip47ExtendedPrivateKey != null);
+        return hasMasterPrivateKey() || hasBtqMasterSecret() || (source == KeystoreSource.SW_PAYMENT_CODE && bip47ExtendedPrivateKey != null);
+    }
+
+    /**
+     * The ML-DSA-44 public key for a BTQ custody wallet node, derived via HKDF from the master secret
+     * and cached. BTQ has no public derivation, so an uncached key requires the decrypted master secret.
+     */
+    public byte[] getBtqPublicKey(WalletNode walletNode) {
+        return getBtqPublicKey(walletNode.getKeyPurpose(), walletNode.getIndex());
+    }
+
+    public byte[] getBtqPublicKey(KeyPurpose keyPurpose, int keyIndex) {
+        List<byte[]> cache = btqPublicKeyCache.computeIfAbsent(keyPurpose, purpose -> new ArrayList<>());
+        if(keyIndex < cache.size() && cache.get(keyIndex) != null) {
+            return cache.get(keyIndex);
+        }
+
+        if(btqMasterSecret == null || btqMasterSecret.isEncrypted()) {
+            throw new IllegalStateException("BTQ master secret is not available to derive public keys");
+        }
+
+        byte[] publicKey = BtqDerivation.derivePublicKey(btqMasterSecret.getSecret(), Network.get(), BtqDerivation.Chain.fromKeyPurpose(keyPurpose), keyIndex);
+        while(cache.size() <= keyIndex) {
+            cache.add(null);
+        }
+        cache.set(keyIndex, publicKey);
+        return publicKey;
+    }
+
+    /** The 32-byte ML-DSA key seed for a BTQ wallet node, for signing. The caller must zeroize it after use. */
+    public byte[] getBtqKeySeed(KeyPurpose keyPurpose, int keyIndex) {
+        if(btqMasterSecret == null || btqMasterSecret.isEncrypted()) {
+            throw new IllegalStateException("BTQ master secret is not available to derive key seeds");
+        }
+
+        return BtqDerivation.deriveKeySeed(btqMasterSecret.getSecret(), Network.get(), BtqDerivation.Chain.fromKeyPurpose(keyPurpose), keyIndex);
     }
 
     public boolean needsPassphrase() {
@@ -373,8 +429,12 @@ public class Keystore extends Persistable {
             throw new InvalidKeystoreException("No key derivation specified");
         }
 
-        if(extendedPublicKey == null && silentPaymentScanAddress == null) {
+        if(extendedPublicKey == null && silentPaymentScanAddress == null && source != KeystoreSource.SW_BTQ_SEED) {
             throw new InvalidKeystoreException("No extended public key or silent payment scan address specified");
+        }
+
+        if(source == KeystoreSource.SW_BTQ_SEED && btqMasterSecret == null) {
+            throw new InvalidKeystoreException("Source of " + source + " but no BTQ master secret is present");
         }
 
         if(label.isEmpty()) {
@@ -457,6 +517,9 @@ public class Keystore extends Persistable {
         if(seed != null) {
             copy.setSeed(seed.copy());
         }
+        if(btqMasterSecret != null) {
+            copy.setBtqMasterSecret(btqMasterSecret.copy());
+        }
         if(externalPaymentCode != null) {
             copy.setExternalPaymentCode(externalPaymentCode.copy());
         }
@@ -482,6 +545,25 @@ public class Keystore extends Persistable {
         keystore.setMasterPrivateExtendedKey(masterPrivateExtendedKey);
         keystore.setLabel("Master Key");
         rederiveKeystoreFromMaster(keystore, policyType, derivation);
+        return keystore;
+    }
+
+    /**
+     * Create a Bitcoin Quantum custody keystore from a 32-byte master secret. The keystore identifies
+     * itself with a synthetic master fingerprint (the first 4 bytes of SHA-256 of the receive-chain
+     * index-0 ML-DSA public key on the given network) since BTQ has no BIP32 tree.
+     */
+    public static Keystore fromBtqMasterSecret(byte[] masterSecret, Network network) {
+        Keystore keystore = new Keystore();
+        keystore.setBtqMasterSecret(new BtqMasterSecret(masterSecret));
+        keystore.setLabel("BTQ Custody");
+        keystore.setSource(KeystoreSource.SW_BTQ_SEED);
+        keystore.setWalletModel(WalletModel.BTQ_CORE);
+
+        byte[] receiveKey = BtqDerivation.derivePublicKey(masterSecret, network, BtqDerivation.Chain.RECEIVE, 0);
+        byte[] fingerprint = Arrays.copyOf(Sha256Hash.hash(receiveKey), 4);
+        keystore.setKeyDerivation(new KeyDerivation(Utils.bytesToHex(fingerprint), "m/0'"));
+
         return keystore;
     }
 
@@ -514,7 +596,7 @@ public class Keystore extends Persistable {
     }
 
     public boolean isEncrypted() {
-        return (seed != null && seed.isEncrypted()) || (masterPrivateExtendedKey != null && masterPrivateExtendedKey.isEncrypted());
+        return (seed != null && seed.isEncrypted()) || (masterPrivateExtendedKey != null && masterPrivateExtendedKey.isEncrypted()) || (btqMasterSecret != null && btqMasterSecret.isEncrypted());
     }
 
     public void encrypt(Key key) {
@@ -523,6 +605,9 @@ public class Keystore extends Persistable {
         }
         if(hasMasterPrivateExtendedKey() && !masterPrivateExtendedKey.isEncrypted()) {
             masterPrivateExtendedKey = masterPrivateExtendedKey.encrypt(key);
+        }
+        if(hasBtqMasterSecret() && !btqMasterSecret.isEncrypted()) {
+            btqMasterSecret = btqMasterSecret.encrypt(key);
         }
     }
 
@@ -533,6 +618,9 @@ public class Keystore extends Persistable {
         if(hasMasterPrivateExtendedKey() && masterPrivateExtendedKey.isEncrypted()) {
             masterPrivateExtendedKey = masterPrivateExtendedKey.decrypt(password);
         }
+        if(hasBtqMasterSecret() && btqMasterSecret.isEncrypted()) {
+            btqMasterSecret = btqMasterSecret.decrypt(password);
+        }
     }
 
     public void decrypt(Key key) {
@@ -542,6 +630,9 @@ public class Keystore extends Persistable {
         if(hasMasterPrivateExtendedKey() && masterPrivateExtendedKey.isEncrypted()) {
             masterPrivateExtendedKey = masterPrivateExtendedKey.decrypt(key);
         }
+        if(hasBtqMasterSecret() && btqMasterSecret.isEncrypted()) {
+            btqMasterSecret = btqMasterSecret.decrypt(key);
+        }
     }
 
     public void clearPrivate() {
@@ -550,6 +641,9 @@ public class Keystore extends Persistable {
         }
         if(hasMasterPrivateExtendedKey()) {
             masterPrivateExtendedKey.clear();
+        }
+        if(hasBtqMasterSecret()) {
+            btqMasterSecret.clear();
         }
     }
 }
