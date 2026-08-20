@@ -181,6 +181,10 @@ public class Keystore extends Persistable {
     /**
      * The ML-DSA-44 public key for a BTQ custody wallet node, derived via HKDF from the master secret
      * and cached. BTQ has no public derivation, so an uncached key requires the decrypted master secret.
+     * <p>
+     * Returns null (never throws) when the key is uncached and the master secret is locked. This is safe:
+     * a wallet can only receive at an address it already derived and registered (which required the
+     * secret), so every <i>used</i> index is always cached; only unused gap-window addresses can be null.
      */
     public byte[] getBtqPublicKey(WalletNode walletNode) {
         return getBtqPublicKey(walletNode.getKeyPurpose(), walletNode.getIndex());
@@ -193,7 +197,7 @@ public class Keystore extends Persistable {
         }
 
         if(btqMasterSecret == null || btqMasterSecret.isEncrypted()) {
-            throw new IllegalStateException("BTQ master secret is not available to derive public keys");
+            return null;
         }
 
         byte[] publicKey = BtqDerivation.derivePublicKey(btqMasterSecret.getSecret(), Network.get(), BtqDerivation.Chain.fromKeyPurpose(keyPurpose), keyIndex);

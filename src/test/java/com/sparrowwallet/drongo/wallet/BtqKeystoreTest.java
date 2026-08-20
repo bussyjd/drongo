@@ -70,8 +70,9 @@ public class BtqKeystoreTest {
         //The pre-warmed cache keeps the gap window readable while locked
         Assertions.assertArrayEquals(receive0, keystore.getBtqPublicKey(KeyPurpose.RECEIVE, 0));
         Assertions.assertEquals(Mldsa44.PUBLIC_KEY_BYTES, keystore.getBtqPublicKey(KeyPurpose.RECEIVE, Keystore.BTQ_CACHE_WARM_INDEXES - 1).length);
-        //Beyond the warmed window, new derivations require the secret
-        Assertions.assertThrows(IllegalStateException.class, () -> keystore.getBtqPublicKey(KeyPurpose.RECEIVE, Keystore.BTQ_CACHE_WARM_INDEXES));
+        //Beyond the warmed window a locked wallet returns null (never throws) — the address is an unused gap-window node
+        Assertions.assertNull(keystore.getBtqPublicKey(KeyPurpose.RECEIVE, Keystore.BTQ_CACHE_WARM_INDEXES));
+        //Signing still requires the secret
         Assertions.assertThrows(IllegalStateException.class, () -> keystore.getBtqKeySeed(KeyPurpose.RECEIVE, 0));
 
         keystore.decrypt(key);
