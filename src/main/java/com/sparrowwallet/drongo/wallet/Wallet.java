@@ -1626,7 +1626,7 @@ public class Wallet extends Persistable implements Comparable<Wallet> {
                 WalletNode signingNode = walletOutputScripts.get(scriptPubKey);
 
                 // BIP32-derivation fallback for inputs beyond the wallet's derived address range
-                if(signingNode == null && useDerivationFallback && policyType != PolicyType.SINGLE_SP) {
+                if(signingNode == null && useDerivationFallback && policyType != PolicyType.SINGLE_SP && policyType != PolicyType.SINGLE_MLDSA) {
                     signingNode = getSigningNodeFromDerivation(psbtInput, scriptPubKey);
                 }
 
@@ -1808,7 +1808,42 @@ public class Wallet extends Persistable implements Comparable<Wallet> {
             }
         }
 
+        if(policyType == PolicyType.SINGLE_MLDSA) {
+            signBtq(psbt);
+            return;
+        }
+
         sign(getSigningNodes(psbt));
+    }
+
+    /** Sign a Bitcoin Quantum P2MR PSBT: supply each input's leaf/root (a watch-only Core wallet cannot emit them) and ML-DSA sign. */
+    private void signBtq(PSBT psbt) {
+        Keystore keystore = getKeystores().get(0);
+        Map<PSBTInput, WalletNode> signingNodes = getSigningNodes(psbt);
+        Map<Integer, byte[]> inputSeeds = new LinkedHashMap<>();
+        try {
+            for(Map.Entry<PSBTInput, WalletNode> signingEntry : signingNodes.entrySet()) {
+                PSBTInput psbtInput = signingEntry.getKey();
+                WalletNode node = signingEntry.getValue();
+                if(psbtInput.isSigned()) {
+                    continue;
+                }
+                byte[] mldsaPubKey = keystore.getBtqPublicKey(node);
+                if(psbtInput.getP2mrLeafScript() == null) {
+                    byte[] leafScript = com.sparrowwallet.drongo.btq.P2MR.singleKeyLeafScript(mldsaPubKey);
+                    psbtInput.setP2mrLeaf(leafScript, (byte)com.sparrowwallet.drongo.btq.P2MR.LEAF_VERSION, com.sparrowwallet.drongo.btq.P2MR.singleLeafControlBlock());
+                    psbtInput.setP2mrMerkleRoot(com.sparrowwallet.drongo.btq.P2MR.tapLeafHash(leafScript));
+                }
+                inputSeeds.put(psbt.getPsbtInputs().indexOf(psbtInput), keystore.getBtqKeySeed(node.getKeyPurpose(), node.getIndex()));
+            }
+            if(!inputSeeds.isEmpty()) {
+                com.sparrowwallet.drongo.btq.BtqPsbtSigner.sign(psbt, inputSeeds);
+            }
+        } finally {
+            for(byte[] seed : inputSeeds.values()) {
+                java.util.Arrays.fill(seed, (byte)0);
+            }
+        }
     }
 
     public void sign(Map<PSBTInput, WalletNode> signingNodes) throws MnemonicException {
@@ -1966,6 +2001,11 @@ public class Wallet extends Persistable implements Comparable<Wallet> {
     }
 
     public void finalise(PSBT psbt) {
+        if(policyType == PolicyType.SINGLE_MLDSA) {
+            com.sparrowwallet.drongo.btq.BtqPsbtSigner.finaliseInputs(psbt);
+            return;
+        }
+
         int threshold = getDefaultPolicy().getNumSignaturesRequired();
         Map<PSBTInput, WalletNode> signingNodes = getSigningNodes(psbt);
 

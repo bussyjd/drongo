@@ -1000,6 +1000,9 @@ public class PSBTInput {
     }
 
     public boolean isSigned() {
+        if(getP2mrDilithiumSignature() != null) {
+            return true;
+        }
         if(getTapKeyPathSignature() != null) {
             return true;
         } else if(!getPartialSignatures().isEmpty()) {
