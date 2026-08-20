@@ -143,6 +143,30 @@ public abstract class Address {
                     nested = e;
                 }
             }
+
+            //Bitcoin Quantum P2MR (Dilithium, witness v2) addresses use the BTQ HRP and Bech32m encoding
+            String btqHrp = network.getBtqBech32AddressHRP();
+            if(btqHrp != null && !btqHrp.isEmpty() && address.toLowerCase(Locale.ROOT).startsWith(btqHrp)) {
+                try {
+                    Bech32.Bech32Data data = Bech32.decode(address);
+                    if(data.hrp.equals(btqHrp)) {
+                        int witnessVersion = data.data[0];
+                        if(witnessVersion == 2) {
+                            if(data.encoding != Bech32.Encoding.BECH32M) {
+                                throw new InvalidAddressException("Invalid address - witness version is 2 but encoding is " + data.encoding);
+                            }
+
+                            byte[] convertedProgram = Arrays.copyOfRange(data.data, 1, data.data.length);
+                            byte[] witnessProgram = Bech32.convertBits(convertedProgram, 0, convertedProgram.length, 5, 8, false);
+                            if(witnessProgram.length == 32) {
+                                return new P2MRAddress(witnessProgram);
+                            }
+                        }
+                    }
+                } catch(Exception e) {
+                    nested = e;
+                }
+            }
         }
 
         if(nested != null) {

@@ -1266,6 +1266,111 @@ public enum ScriptType {
         public List<PolicyType> getAllowedPolicyTypes() {
             return Collections.emptyList();
         }
+    },
+    P2MR("P2MR", "Dilithium (P2MR)", "m/86'/0'/0'") {
+        @Override
+        public Address getAddress(byte[] merkleRoot) {
+            return new P2MRAddress(merkleRoot);
+        }
+
+        @Override
+        public Address getAddress(PolicyType policyType, ECKey key) {
+            throw new ProtocolException("P2MR uses ML-DSA keys, not an ECKey - use com.sparrowwallet.drongo.btq.P2MR");
+        }
+
+        @Override
+        public Address getAddress(Script script) {
+            return getAddress(getHashFromScript(script));
+        }
+
+        @Override
+        public Script getOutputScript(byte[] merkleRoot) {
+            if(merkleRoot.length != 32) {
+                throw new ProtocolException("P2MR witness program must be exactly 32 bytes");
+            }
+            List<ScriptChunk> chunks = new ArrayList<>();
+            chunks.add(new ScriptChunk(OP_2, null));
+            chunks.add(new ScriptChunk(merkleRoot.length, merkleRoot));
+
+            return new Script(chunks);
+        }
+
+        @Override
+        public Script getOutputScript(PolicyType policyType, ECKey key) {
+            throw new ProtocolException("P2MR uses ML-DSA keys, not an ECKey - use com.sparrowwallet.drongo.btq.P2MR");
+        }
+
+        @Override
+        public Script getOutputScript(Script script) {
+            throw new ProtocolException("Cannot create a P2MR output script from a script");
+        }
+
+        @Override
+        public String getOutputDescriptor(ECKey key) {
+            throw new ProtocolException("P2MR output descriptors are not defined for ML-DSA keys");
+        }
+
+        @Override
+        public String getOutputDescriptor(Script script) {
+            throw new ProtocolException("P2MR output descriptors are not defined");
+        }
+
+        @Override
+        public String getDescriptor() {
+            return "p2mr(";
+        }
+
+        @Override
+        public boolean isScriptType(Script script) {
+            List<ScriptChunk> chunks = script.chunks;
+            if(chunks.size() != 2)
+                return false;
+            if(!chunks.get(0).equalsOpCode(OP_2))
+                return false;
+            byte[] chunk1data = chunks.get(1).data;
+            if(chunk1data == null)
+                return false;
+            return chunk1data.length == 32;
+        }
+
+        @Override
+        public byte[] getHashFromScript(Script script) {
+            return script.chunks.get(1).data;
+        }
+
+        @Override
+        public Script getScriptSig(PolicyType policyType, Script scriptPubKey, ECKey pubKey, TransactionSignature signature) {
+            if(!isScriptType(scriptPubKey)) {
+                throw new ProtocolException("Provided scriptPubKey is not a " + getName() + " script");
+            }
+
+            return new Script(new byte[0]);
+        }
+
+        @Override
+        public TransactionInput addSpendingInput(PolicyType policyType, Transaction transaction, TransactionOutput prevOutput, ECKey pubKey, TransactionSignature signature) {
+            throw new UnsupportedOperationException("P2MR inputs are witness-assembled by the BTQ signing service, not from a TransactionSignature");
+        }
+
+        @Override
+        public Script getMultisigScriptSig(PolicyType policyType, Script scriptPubKey, int threshold, Map<ECKey, TransactionSignature> pubKeySignatures) {
+            throw new UnsupportedOperationException("Constructing P2MR inputs is handled by the BTQ signing service");
+        }
+
+        @Override
+        public TransactionInput addMultisigSpendingInput(PolicyType policyType, Transaction transaction, TransactionOutput prevOutput, int threshold, Map<ECKey, TransactionSignature> pubKeySignatures) {
+            throw new UnsupportedOperationException("Constructing P2MR inputs is handled by the BTQ signing service");
+        }
+
+        @Override
+        public TransactionSignature.Type getSignatureType() {
+            throw new UnsupportedOperationException("P2MR uses ML-DSA signatures, which are not a TransactionSignature.Type");
+        }
+
+        @Override
+        public List<PolicyType> getAllowedPolicyTypes() {
+            return Collections.emptyList();
+        }
     };
 
     private final String name;
