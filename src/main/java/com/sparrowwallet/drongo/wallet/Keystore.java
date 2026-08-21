@@ -6,7 +6,6 @@ import com.sparrowwallet.drongo.KeyPurpose;
 import com.sparrowwallet.drongo.Network;
 import com.sparrowwallet.drongo.Utils;
 import com.sparrowwallet.drongo.btq.BtqDerivation;
-import com.sparrowwallet.drongo.btq.Mldsa44;
 import com.sparrowwallet.drongo.bip47.PaymentAddress;
 import com.sparrowwallet.drongo.bip47.PaymentCode;
 import com.sparrowwallet.drongo.crypto.*;

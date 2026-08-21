@@ -35,14 +35,6 @@ public final class Mldsa44 {
         return publicKey;
     }
 
-    /** Expand a 32-byte seed to the 2560-byte FIPS 204 secret key. */
-    public static byte[] secretKeyFromSeed(byte[] seed) {
-        requireLength(seed, SEED_BYTES, "ML-DSA seed");
-        byte[] secretKey = privateKeyFromSeed(seed).getPrivateKey();
-        requireLength(secretKey, SECRET_KEY_BYTES, "ML-DSA secret key");
-        return secretKey;
-    }
-
     /** Sign the exact 32-byte BTQ transaction sighash with an empty FIPS 204 context, appending the sighash byte. */
     public static byte[] signTransactionHash(byte[] seed, byte[] transactionHash) {
         requireLength(transactionHash, TRANSACTION_HASH_BYTES, "transaction hash");

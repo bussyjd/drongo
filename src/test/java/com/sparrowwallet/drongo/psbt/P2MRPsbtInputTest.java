@@ -1,6 +1,5 @@
 package com.sparrowwallet.drongo.psbt;
 
-import com.sparrowwallet.drongo.Network;
 import com.sparrowwallet.drongo.btq.Mldsa44;
 import com.sparrowwallet.drongo.btq.P2MR;
 import com.sparrowwallet.drongo.protocol.Script;
