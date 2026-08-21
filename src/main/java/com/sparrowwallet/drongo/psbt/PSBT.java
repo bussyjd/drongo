@@ -621,6 +621,11 @@ public class PSBT {
     }
 
     public void addKeyPathInformation(Wallet signingWallet) {
+        if(signingWallet != null && signingWallet.getPolicyType() == PolicyType.SINGLE_MLDSA) {
+            //BTQ P2MR inputs carry their own leaf/root/signature (0x19/0x1a/0x1b); there is no BIP32 key path
+            return;
+        }
+
         List<PSBTInput> missingKeyPathInputs = new ArrayList<>();
         for(PSBTInput psbtInput : getPsbtInputs()) {
             ScriptType scriptType = psbtInput.getScriptType();

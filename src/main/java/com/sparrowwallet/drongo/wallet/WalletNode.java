@@ -337,7 +337,9 @@ public class WalletNode extends Persistable implements Comparable<WalletNode> {
     }
 
     public Script getOutputScript() {
-        return getAddress().getOutputScript();
+        //null for a locked BTQ wallet's uncached (unused gap-window) node - see Keystore.getBtqPublicKey
+        Address nodeAddress = getAddress();
+        return nodeAddress == null ? null : nodeAddress.getOutputScript();
     }
 
     public String getOutputDescriptor() {

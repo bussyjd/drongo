@@ -856,7 +856,11 @@ public class Wallet extends Persistable implements Comparable<Wallet> {
 
     private void getWalletOutputScripts(Map<Script, WalletNode> walletOutputScripts, WalletNode purposeNode) {
         for(WalletNode addressNode : purposeNode.getChildren()) {
-            walletOutputScripts.put(addressNode.getOutputScript(), addressNode);
+            Script outputScript = addressNode.getOutputScript();
+            //null for a locked BTQ wallet's uncached (unused gap-window) node - it cannot own any output
+            if(outputScript != null) {
+                walletOutputScripts.put(outputScript, addressNode);
+            }
         }
     }
 
@@ -1800,6 +1804,15 @@ public class Wallet extends Persistable implements Comparable<Wallet> {
     public Map<PSBTInput, Map<TransactionSignature, Keystore>> getSignedKeystores(PSBT psbt) {
         Map<PSBTInput, WalletNode> signingNodes = getSigningNodes(psbt);
         Map<PSBTInput, Map<TransactionSignature, Keystore>> signedKeystores = new LinkedHashMap<>();
+
+        if(policyType == PolicyType.SINGLE_MLDSA) {
+            //BTQ P2MR uses ML-DSA signatures on the input (field 0x1b), not TransactionSignatures; report
+            //the per-input signed state so the UI enables signing and reflects completion without an ECKey path
+            for(PSBTInput psbtInput : signingNodes.keySet()) {
+                signedKeystores.put(psbtInput, new LinkedHashMap<>());
+            }
+            return signedKeystores;
+        }
 
         for(PSBTInput psbtInput : signingNodes.keySet()) {
             WalletNode walletNode = signingNodes.get(psbtInput);
