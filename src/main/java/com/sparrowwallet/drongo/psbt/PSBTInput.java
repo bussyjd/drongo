@@ -999,6 +999,10 @@ public class PSBTInput {
         this.silentPaymentsTweak = silentPaymentsTweak;
     }
 
+    public PSBT getPsbt() {
+        return psbt;
+    }
+
     public boolean isSigned() {
         if(getP2mrDilithiumSignature() != null) {
             return true;

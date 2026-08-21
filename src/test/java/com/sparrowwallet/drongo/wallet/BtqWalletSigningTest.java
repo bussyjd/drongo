@@ -12,6 +12,7 @@ import com.sparrowwallet.drongo.protocol.ScriptType;
 import com.sparrowwallet.drongo.protocol.Sha256Hash;
 import com.sparrowwallet.drongo.protocol.Transaction;
 import com.sparrowwallet.drongo.protocol.TransactionOutput;
+import com.sparrowwallet.drongo.protocol.TransactionSignature;
 import com.sparrowwallet.drongo.protocol.TransactionWitness;
 import com.sparrowwallet.drongo.psbt.PSBT;
 import com.sparrowwallet.drongo.psbt.PSBTInput;
@@ -19,6 +20,7 @@ import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Test;
 
 import java.util.Arrays;
+import java.util.Map;
 
 /**
  * End-to-end wallet-level signing: a SINGLE_MLDSA wallet signs and finalizes a PSBT that carries only
@@ -102,5 +104,42 @@ public class BtqWalletSigningTest {
         byte[] firstSignature = psbt.getPsbtInputs().get(0).getP2mrDilithiumSignature();
         wallet.sign(psbt); //second pass must not re-sign or corrupt
         Assertions.assertArrayEquals(firstSignature, psbt.getPsbtInputs().get(0).getP2mrDilithiumSignature());
+    }
+
+    /**
+     * The Sparrow UI signs through the signing-nodes overload (HeadersController.signUnencryptedKeystores),
+     * not sign(PSBT), and drives its progress/finalize chain from getSignedKeystores - both must work for P2MR.
+     */
+    @Test
+    public void testUiSignPathSignsViaSigningNodesOverload() throws Exception {
+        Wallet wallet = buildWallet();
+        WalletNode receive0 = new WalletNode(wallet, KeyPurpose.RECEIVE, 0);
+        Script nodeScript = wallet.getOutputScript(receive0);
+
+        byte[] prevHash = new byte[32];
+        Arrays.fill(prevHash, (byte)0x44);
+        Transaction tx = new Transaction();
+        tx.setVersion(2);
+        tx.addInput(Sha256Hash.wrap(prevHash), 0, new Script(new byte[0]));
+        tx.addOutput(60_000L, nodeScript);
+
+        PSBT psbt = new PSBT(tx);
+        PSBTInput input = psbt.getPsbtInputs().get(0);
+        input.setWitnessUtxo(new TransactionOutput(tx, 80_000L, nodeScript));
+
+        Map<PSBTInput, Map<TransactionSignature, Keystore>> unsigned = wallet.getSignedKeystores(psbt);
+        Assertions.assertTrue(unsigned.containsKey(input));
+        Assertions.assertTrue(unsigned.get(input).isEmpty(), "unsigned input must report no signatures");
+
+        wallet.sign(wallet.getSigningNodes(psbt));
+
+        Assertions.assertTrue(input.isSigned(), "P2MR input must be signed via the signing-nodes overload");
+        byte[] pubKey = wallet.getKeystores().get(0).getBtqPublicKey(KeyPurpose.RECEIVE, 0);
+        byte[] sighash = BtqPsbtSigner.sighash(psbt, 0);
+        Assertions.assertTrue(Mldsa44.verifyTransactionHash(pubKey, sighash, input.getP2mrDilithiumSignature()));
+
+        Map<PSBTInput, Map<TransactionSignature, Keystore>> signed = wallet.getSignedKeystores(psbt);
+        Assertions.assertEquals(1, signed.get(input).size(), "signed input must report its keystore for UI progress");
+        Assertions.assertSame(wallet.getKeystores().get(0), signed.get(input).values().iterator().next());
     }
 }

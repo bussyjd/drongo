@@ -1807,9 +1807,15 @@ public class Wallet extends Persistable implements Comparable<Wallet> {
 
         if(policyType == PolicyType.SINGLE_MLDSA) {
             //BTQ P2MR uses ML-DSA signatures on the input (field 0x1b), not TransactionSignatures; report
-            //the per-input signed state so the UI enables signing and reflects completion without an ECKey path
+            //each signed input against the single keystore (with a placeholder signature as the map key)
+            //so the signature progress and finalization chain works without an ECKey path
+            Keystore btqKeystore = getKeystores().get(0);
             for(PSBTInput psbtInput : signingNodes.keySet()) {
-                signedKeystores.put(psbtInput, new LinkedHashMap<>());
+                Map<TransactionSignature, Keystore> inputSignatureKeystores = new LinkedHashMap<>();
+                if(psbtInput.isSigned()) {
+                    inputSignatureKeystores.put(TransactionSignature.dummy(TransactionSignature.Type.SCHNORR), btqKeystore);
+                }
+                signedKeystores.put(psbtInput, inputSignatureKeystores);
             }
             return signedKeystores;
         }
@@ -1863,8 +1869,11 @@ public class Wallet extends Persistable implements Comparable<Wallet> {
 
     /** Sign a Bitcoin Quantum P2MR PSBT: supply each input's leaf/root (a watch-only Core wallet cannot emit them) and ML-DSA sign. */
     private void signBtq(PSBT psbt) {
+        signBtq(psbt, getSigningNodes(psbt));
+    }
+
+    private void signBtq(PSBT psbt, Map<PSBTInput, WalletNode> signingNodes) {
         Keystore keystore = getKeystores().get(0);
-        Map<PSBTInput, WalletNode> signingNodes = getSigningNodes(psbt);
         Map<Integer, byte[]> inputSeeds = new LinkedHashMap<>();
         try {
             for(Map.Entry<PSBTInput, WalletNode> signingEntry : signingNodes.entrySet()) {
@@ -1892,6 +1901,14 @@ public class Wallet extends Persistable implements Comparable<Wallet> {
     }
 
     public void sign(Map<PSBTInput, WalletNode> signingNodes) throws MnemonicException {
+        if(policyType == PolicyType.SINGLE_MLDSA) {
+            //BTQ P2MR signing does not use per-keystore ECKeys; dispatch to the ML-DSA path
+            if(!signingNodes.isEmpty()) {
+                signBtq(signingNodes.keySet().iterator().next().getPsbt(), signingNodes);
+            }
+            return;
+        }
+
         for(Map.Entry<PSBTInput, WalletNode> signingEntry : signingNodes.entrySet()) {
             Wallet signingWallet = signingEntry.getValue().getWallet();
             for(Keystore keystore : signingWallet.getKeystores()) {
