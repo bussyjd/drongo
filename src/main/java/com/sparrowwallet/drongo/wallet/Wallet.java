@@ -111,6 +111,10 @@ public class Wallet extends Persistable implements Comparable<Wallet> {
     }
 
     public Wallet addChildWallet(StandardAccount standardAccount) {
+        if(policyType == PolicyType.SINGLE_MLDSA) {
+            //BTQ derivation has no account dimension - a child account would duplicate the parent's addresses
+            throw new UnsupportedOperationException("Bitcoin Quantum wallets do not support additional accounts");
+        }
         Wallet childWallet = this.copy();
 
         if(!isMasterWallet()) {
