@@ -129,7 +129,7 @@ public class PSBT {
             Collections.swap(walletTransactionOutputs, i, j);
         }
 
-        if(includeGlobalXpubs && wallet.getPolicyType() != PolicyType.SINGLE_SP) {
+        if(includeGlobalXpubs && wallet.getPolicyType() != PolicyType.SINGLE_SP && wallet.getPolicyType() != PolicyType.SINGLE_MLDSA) {
             for(Keystore keystore : wallet.getKeystores()) {
                 extendedPublicKeys.put(keystore.getExtendedPublicKey(), keystore.getKeyDerivation());
             }
@@ -170,12 +170,13 @@ public class PSBT {
                     ECKey spendPubKey = keystore.getSilentPaymentScanAddress().getSpendKey();
                     KeyDerivation spendKeyDerivation = new KeyDerivation(keystore.getKeyDerivation().getMasterFingerprint(), KeyDerivation.writePath(KeyDerivation.getBip352SpendDerivation(keystore.getKeyDerivation().getDerivation())));
                     spSpendDerivations.put(spendPubKey, spendKeyDerivation);
-                } else {
+                } else if(signingWallet.getPolicyType() != PolicyType.SINGLE_MLDSA) {
                     derivedPublicKeys.put(signingWallet.getScriptType().getOutputKey(signingWallet.getPolicyType(), keystore.getPubKey(walletNode)), keystore.getKeyDerivation().extend(walletNode.getDerivation()));
                     if(signingWallet.getScriptType() == ScriptType.P2TR) {
                         tapInternalKey = keystore.getPubKey(walletNode);
                     }
                 }
+                //A Bitcoin Quantum keystore has no BIP32 metadata; Wallet.sign supplies the P2MR fields
             }
 
             PSBTInput psbtInput = new PSBTInput(this, signingWallet.getScriptType(), inputIndex, utxo, utxoIndex, txInput.getSequenceNumber(),
@@ -213,10 +214,12 @@ public class PSBT {
 
                 Map<ECKey, KeyDerivation> derivedPublicKeys = new LinkedHashMap<>();
                 ECKey tapInternalKey = null;
-                for(Keystore keystore : recipientWallet.getKeystores()) {
-                    derivedPublicKeys.put(recipientWallet.getScriptType().getOutputKey(recipientWallet.getPolicyType(), keystore.getPubKey(outputNode)), keystore.getKeyDerivation().extend(outputNode.getDerivation()));
-                    if(recipientWallet.getScriptType() == ScriptType.P2TR) {
-                        tapInternalKey = keystore.getPubKey(outputNode);
+                if(recipientWallet.getPolicyType() != PolicyType.SINGLE_MLDSA) {
+                    for(Keystore keystore : recipientWallet.getKeystores()) {
+                        derivedPublicKeys.put(recipientWallet.getScriptType().getOutputKey(recipientWallet.getPolicyType(), keystore.getPubKey(outputNode)), keystore.getKeyDerivation().extend(outputNode.getDerivation()));
+                        if(recipientWallet.getScriptType() == ScriptType.P2TR) {
+                            tapInternalKey = keystore.getPubKey(outputNode);
+                        }
                     }
                 }
 
@@ -618,6 +621,11 @@ public class PSBT {
     }
 
     public void addKeyPathInformation(Wallet signingWallet) {
+        if(signingWallet != null && signingWallet.getPolicyType() == PolicyType.SINGLE_MLDSA) {
+            //BTQ P2MR inputs carry their own leaf/root/signature (0x19/0x1a/0x1b); there is no BIP32 key path
+            return;
+        }
+
         List<PSBTInput> missingKeyPathInputs = new ArrayList<>();
         for(PSBTInput psbtInput : getPsbtInputs()) {
             ScriptType scriptType = psbtInput.getScriptType();

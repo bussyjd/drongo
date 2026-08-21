@@ -213,7 +213,8 @@ public class WalletNode extends Persistable implements Comparable<WalletNode> {
         if(wallet.isValid()) {
             if(!wallet.getDetachedLabels().isEmpty()) {
                 for(WalletNode newNode : newNodes) {
-                    String label = wallet.getDetachedLabels().remove(newNode.getAddress().toString());
+                    Address newNodeAddress = newNode.getAddress();
+                    String label = newNodeAddress == null ? null : wallet.getDetachedLabels().remove(newNodeAddress.toString());
                     if(label != null && (newNode.getLabel() == null || newNode.getLabel().isEmpty())) {
                         newNode.setLabel(label);
                     }
@@ -336,7 +337,9 @@ public class WalletNode extends Persistable implements Comparable<WalletNode> {
     }
 
     public Script getOutputScript() {
-        return getAddress().getOutputScript();
+        //null for a locked BTQ wallet's uncached (unused gap-window) node - see Keystore.getBtqPublicKey
+        Address nodeAddress = getAddress();
+        return nodeAddress == null ? null : nodeAddress.getOutputScript();
     }
 
     public String getOutputDescriptor() {

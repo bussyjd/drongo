@@ -86,6 +86,12 @@ public final class BtqPsbtSigner {
      * return the finalized network transaction. Inputs without a Dilithium signature are left untouched.
      */
     public static Transaction finalise(PSBT psbt) throws PSBTProofException {
+        finaliseInputs(psbt);
+        return psbt.extractTransaction();
+    }
+
+    /** Assemble the P2MR witness {@code [signature, leafScript, controlBlock]} for every signed input, without extracting. */
+    public static void finaliseInputs(PSBT psbt) {
         Transaction transaction = psbt.getTransaction();
         for(int i = 0; i < psbt.getPsbtInputs().size(); i++) {
             PSBTInput input = psbt.getPsbtInputs().get(i);
@@ -98,7 +104,6 @@ public final class BtqPsbtSigner {
             TransactionWitness witness = new TransactionWitness(transaction, List.of(signature, leafScript, controlBlock));
             input.setFinalScriptWitness(witness);
         }
-        return psbt.extractTransaction();
     }
 
     /** The transaction fee in satoshis: sum of spent (witness UTXO) amounts minus sum of output amounts. */

@@ -111,6 +111,10 @@ public class Wallet extends Persistable implements Comparable<Wallet> {
     }
 
     public Wallet addChildWallet(StandardAccount standardAccount) {
+        if(policyType == PolicyType.SINGLE_MLDSA) {
+            //BTQ derivation has no account dimension - a child account would duplicate the parent's addresses
+            throw new UnsupportedOperationException("Bitcoin Quantum wallets do not support additional accounts");
+        }
         Wallet childWallet = this.copy();
 
         if(!isMasterWallet()) {
@@ -725,7 +729,8 @@ public class Wallet extends Persistable implements Comparable<Wallet> {
     public Address getAddress(WalletNode node) {
         if(policyType == PolicyType.SINGLE_MLDSA) {
             byte[] mldsaPubKey = getKeystores().get(0).getBtqPublicKey(node);
-            return com.sparrowwallet.drongo.btq.P2MR.addressForPublicKey(mldsaPubKey);
+            //null when a locked wallet is asked for an uncached (unused gap-window) address
+            return mldsaPubKey == null ? null : com.sparrowwallet.drongo.btq.P2MR.addressForPublicKey(mldsaPubKey);
         }
         if(policyType == PolicyType.SINGLE_HD || policyType == PolicyType.SINGLE_SP) {
             ECKey pubKey = node.getPubKey();
@@ -742,7 +747,7 @@ public class Wallet extends Persistable implements Comparable<Wallet> {
     public Script getOutputScript(WalletNode node) {
         if(policyType == PolicyType.SINGLE_MLDSA) {
             byte[] mldsaPubKey = getKeystores().get(0).getBtqPublicKey(node);
-            return ScriptType.P2MR.getOutputScript(com.sparrowwallet.drongo.btq.P2MR.merkleRootForPublicKey(mldsaPubKey));
+            return mldsaPubKey == null ? null : ScriptType.P2MR.getOutputScript(com.sparrowwallet.drongo.btq.P2MR.merkleRootForPublicKey(mldsaPubKey));
         }
         if(policyType == PolicyType.SINGLE_HD || policyType == PolicyType.SINGLE_SP) {
             ECKey pubKey = node.getPubKey();
@@ -759,7 +764,8 @@ public class Wallet extends Persistable implements Comparable<Wallet> {
     public String getOutputDescriptor(WalletNode node) {
         if(policyType == PolicyType.SINGLE_MLDSA) {
             //No standard descriptor exists for raw ML-DSA keys; BTQ Core imports P2MR addresses via addr()
-            return "addr(" + getAddress(node) + ")";
+            Address address = getAddress(node);
+            return address == null ? null : "addr(" + address + ")";
         }
         if(policyType == PolicyType.SINGLE_HD || policyType == PolicyType.SINGLE_SP) {
             ECKey pubKey = node.getPubKey();
@@ -854,7 +860,11 @@ public class Wallet extends Persistable implements Comparable<Wallet> {
 
     private void getWalletOutputScripts(Map<Script, WalletNode> walletOutputScripts, WalletNode purposeNode) {
         for(WalletNode addressNode : purposeNode.getChildren()) {
-            walletOutputScripts.put(addressNode.getOutputScript(), addressNode);
+            Script outputScript = addressNode.getOutputScript();
+            //null for a locked BTQ wallet's uncached (unused gap-window) node - it cannot own any output
+            if(outputScript != null) {
+                walletOutputScripts.put(outputScript, addressNode);
+            }
         }
     }
 
@@ -1040,7 +1050,22 @@ public class Wallet extends Persistable implements Comparable<Wallet> {
      *
      * @return the number of vBytes
      */
+    /** The virtual size of a constructed transaction, honouring Bitcoin Quantum's witness scale factor of 16. */
+    public double getVirtualSize(Transaction transaction) {
+        if(policyType == PolicyType.SINGLE_MLDSA) {
+            //BTQ weight = stripped_size * 15 + total_size; vsize = weight / 16
+            int totalSize = transaction.bitcoinSerialize().length;
+            int strippedSize = transaction.bitcoinSerialize(false).length;
+            return Math.ceil((strippedSize * 15d + totalSize) / 16d);
+        }
+        return transaction.getVirtualSize();
+    }
+
     public int getInputVbytes() {
+        if(policyType == PolicyType.SINGLE_MLDSA) {
+            //BTQ single-key P2MR: 4402 WU at Bitcoin Quantum's witness scale factor of 16
+            return (int)Math.ceil(4402d / 16);
+        }
         return (int)Math.ceil((double)getInputWeightUnits() / (double)WITNESS_SCALE_FACTOR);
     }
 
@@ -1050,6 +1075,11 @@ public class Wallet extends Persistable implements Comparable<Wallet> {
      * @return the number of weight units (WU)
      */
     public int getInputWeightUnits() {
+        if(policyType == PolicyType.SINGLE_MLDSA) {
+            //41 non-witness bytes at 16x plus the maximum single-key P2MR witness (~3746 bytes)
+            return 4402;
+        }
+
         //Estimate assuming an input spending from the parent receive node - it does not matter this node has no real utxos
         WalletNode receiveNode = new WalletNode(this, KeyPurpose.RECEIVE);
 
@@ -1174,7 +1204,7 @@ public class Wallet extends Persistable implements Comparable<Wallet> {
                 outputs.add(new WalletTransaction.NonAddressOutput(output));
             }
 
-            double noChangeVSize = transaction.getVirtualSize();
+            double noChangeVSize = getVirtualSize(transaction);
             long noChangeFeeRequiredAmt = params.getRequiredFeeAmount(noChangeVSize);
 
             //Add 1 satoshi to accommodate longer signatures when feeRate equals the current or common min relay fee to ensure fee is sufficient for maximum "relayability"
@@ -1212,12 +1242,12 @@ public class Wallet extends Persistable implements Comparable<Wallet> {
 
             //Determine if a change output is required by checking if its value exceeds both the cost of change and the relay dust threshold
             List<Long> setChangeAmts = getSetChangeAmounts(selectedUtxoSets, totalPaymentAmount, noChangeFeeRequiredAmt);
-            double noChangeFeeRate = (params.fee() == null ? params.feeRate() : noChangeFeeRequiredAmt / transaction.getVirtualSize());
+            double noChangeFeeRate = (params.fee() == null ? params.feeRate() : noChangeFeeRequiredAmt / getVirtualSize(transaction));
             TransactionOutput changeOutput = new TransactionOutput(transaction, setChangeAmts.getFirst(), getNode(KeyPurpose.CHANGE).getOutputScript());
             long costOfChangeAmt = getCostOfChange(noChangeFeeRate, params.longTermFeeRate());
             long dustThresholdAmt = getDustThreshold(changeOutput, Transaction.DUST_RELAY_TX_FEE);
             long minChangeAmt = Math.max(costOfChangeAmt, dustThresholdAmt);
-            if(setChangeAmts.stream().allMatch(amt -> amt > minChangeAmt) || (numSets > 1 && differenceAmt / transaction.getVirtualSize() > noChangeFeeRate * 2)) {
+            if(setChangeAmts.stream().allMatch(amt -> amt > minChangeAmt) || (numSets > 1 && differenceAmt / getVirtualSize(transaction) > noChangeFeeRate * 2)) {
                 //Change output is required, determine new fee once change output has been added
                 double changeVSize = noChangeVSize + changeOutput.getLength() * numSets;
                 long changeFeeRequiredAmt = params.getRequiredFeeAmount(changeVSize);
@@ -1244,7 +1274,12 @@ public class Wallet extends Persistable implements Comparable<Wallet> {
                         changeNode = getFreshNode(getChangeKeyPurpose(), changeNode);
                     }
                     for(Long setChangeAmt : setChangeAmts) {
-                        TransactionOutput output = transaction.addOutput(setChangeAmt, changeNode.getOutputScript());
+                        Script changeScript = changeNode.getOutputScript();
+                        if(changeScript == null) {
+                            throw new IllegalStateException("Cannot derive the BTQ change address at index " + changeNode.getIndex() +
+                                    " while the wallet is locked. Unlock the wallet (open Settings and enter the password) to extend the key cache, then retry.");
+                        }
+                        TransactionOutput output = transaction.addOutput(setChangeAmt, changeScript);
                         outputs.add(new WalletTransaction.ChangeOutput(output, changeNode, setChangeAmt));
                         changeMap.put(changeNode, setChangeAmt);
                         changeNode = getFreshNode(getChangeKeyPurpose(), changeNode);
@@ -1253,7 +1288,7 @@ public class Wallet extends Persistable implements Comparable<Wallet> {
 
                 if(setChangeAmts.stream().anyMatch(amt -> amt < minChangeAmt)) {
                     //The new fee has meant that one of the change outputs is now dust. We pay too high a fee without change, but change is dust when added.
-                    if(numSets > 1 && differenceAmt / transaction.getVirtualSize() < noChangeFeeRate * 2) {
+                    if(numSets > 1 && differenceAmt / getVirtualSize(transaction) < noChangeFeeRate * 2) {
                         //Maximize privacy. Pay a higher fee to keep multiple output sets.
                         return new WalletTransaction(this, transaction, params.utxoSelectors(), selectedUtxoSets, txPayments, outputs, differenceAmt);
                     } else {
@@ -1316,6 +1351,16 @@ public class Wallet extends Persistable implements Comparable<Wallet> {
                 pubKeySignatures.put(pubKeys.get(i), i < threshold ? TransactionSignature.dummy(signingWallet.getScriptType().getSignatureType()) : null);
             }
             return signingWallet.getScriptType().addMultisigSpendingInput(signingWallet.getPolicyType(), transaction, prevTxOut, threshold, pubKeySignatures);
+        } else if(signingWallet.getPolicyType().equals(PolicyType.SINGLE_MLDSA)) {
+            //Dummy single-key P2MR spend: empty scriptSig plus the 3-push witness [signature, leafScript, controlBlock].
+            //Note serialization-based size estimates remain conservative for BTQ (drongo serializes witnesses at scale 4,
+            //BTQ discounts at scale 16); coin selection uses the wallet's explicit 4402 WU / 276 vB input constants.
+            byte[] mldsaPubKey = signingWallet.getKeystores().get(0).getBtqPublicKey(walletNode);
+            byte[] leafScript = com.sparrowwallet.drongo.btq.P2MR.singleKeyLeafScript(mldsaPubKey);
+            TransactionWitness dummyWitness = new TransactionWitness(transaction, List.of(
+                    new byte[com.sparrowwallet.drongo.btq.Mldsa44.TRANSACTION_SIGNATURE_BYTES], leafScript,
+                    com.sparrowwallet.drongo.btq.P2MR.singleLeafControlBlock()));
+            return transaction.addInput(prevTxOut.getHash(), prevTxOut.getIndex(), new Script(new byte[0]), dummyWitness);
         } else {
             throw new UnsupportedOperationException("Cannot create transaction for policy type " + signingWallet.getPolicyType());
         }
@@ -1393,6 +1438,11 @@ public class Wallet extends Persistable implements Comparable<Wallet> {
 
     private void getGroupedUtxos(List<OutputGroup> outputGroups, WalletNode purposeNode, List<TxoFilter> txoFilters, Map<Sha256Hash, BlockTransaction> walletTransactions, Map<BlockTransactionHashIndex, WalletNode> walletTxos, double feeRate, double longTermFeeRate, boolean groupByAddress) {
         int inputWeightUnits = getInputWeightUnits();
+        if(policyType == PolicyType.SINGLE_MLDSA) {
+            //OutputGroup divides weight by the Bitcoin witness scale factor; normalise the scale-16
+            //weight so each P2MR input's effective fee cost is its true vsize, not 4x it
+            inputWeightUnits = getInputVbytes() * WITNESS_SCALE_FACTOR;
+        }
         for(WalletNode addressNode : purposeNode.getChildren()) {
             OutputGroup outputGroup = null;
             for(BlockTransactionHashIndex utxo : addressNode.getTransactionOutputs(txoFilters)) {
@@ -1473,7 +1523,9 @@ public class Wallet extends Persistable implements Comparable<Wallet> {
         Map<Wallet, Integer> cachedInputWeightUnits = new HashMap<>();
         Transaction transaction = new Transaction();
         for(Map.Entry<BlockTransactionHashIndex, WalletNode> utxo : availableTxos.entrySet()) {
-            int inputWeightUnits = cachedInputWeightUnits.computeIfAbsent(utxo.getValue().getWallet(), Wallet::getInputWeightUnits);
+            //Mirror getGroupedUtxos: normalise scale-16 P2MR weight so the scale-4 division below yields true vbytes
+            int inputWeightUnits = cachedInputWeightUnits.computeIfAbsent(utxo.getValue().getWallet(),
+                    utxoWallet -> utxoWallet.getPolicyType() == PolicyType.SINGLE_MLDSA ? utxoWallet.getInputVbytes() * WITNESS_SCALE_FACTOR : utxoWallet.getInputWeightUnits());
             long minInputValue = (long)Math.ceil(feeRate * inputWeightUnits / WITNESS_SCALE_FACTOR);
             if(utxo.getKey().getValue() > minInputValue) {
                 Transaction prevTx = getWalletTransaction(utxo.getKey().getHash()).getTransaction();
@@ -1487,7 +1539,7 @@ public class Wallet extends Persistable implements Comparable<Wallet> {
             transaction.addOutput(1L, address);
         }
 
-        long fee = (long)Math.floor(transaction.getVirtualSize() * feeRate);
+        long fee = (long)Math.floor(getVirtualSize(transaction) * feeRate);
         return maxInputValue - fee;
     }
 
@@ -1626,7 +1678,7 @@ public class Wallet extends Persistable implements Comparable<Wallet> {
                 WalletNode signingNode = walletOutputScripts.get(scriptPubKey);
 
                 // BIP32-derivation fallback for inputs beyond the wallet's derived address range
-                if(signingNode == null && useDerivationFallback && policyType != PolicyType.SINGLE_SP) {
+                if(signingNode == null && useDerivationFallback && policyType != PolicyType.SINGLE_SP && policyType != PolicyType.SINGLE_MLDSA) {
                     signingNode = getSigningNodeFromDerivation(psbtInput, scriptPubKey);
                 }
 
@@ -1769,6 +1821,21 @@ public class Wallet extends Persistable implements Comparable<Wallet> {
         Map<PSBTInput, WalletNode> signingNodes = getSigningNodes(psbt);
         Map<PSBTInput, Map<TransactionSignature, Keystore>> signedKeystores = new LinkedHashMap<>();
 
+        if(policyType == PolicyType.SINGLE_MLDSA) {
+            //BTQ P2MR uses ML-DSA signatures on the input (field 0x1b), not TransactionSignatures; report
+            //each signed input against the single keystore (with a placeholder signature as the map key)
+            //so the signature progress and finalization chain works without an ECKey path
+            Keystore btqKeystore = getKeystores().get(0);
+            for(PSBTInput psbtInput : signingNodes.keySet()) {
+                Map<TransactionSignature, Keystore> inputSignatureKeystores = new LinkedHashMap<>();
+                if(psbtInput.isSigned()) {
+                    inputSignatureKeystores.put(TransactionSignature.dummy(TransactionSignature.Type.SCHNORR), btqKeystore);
+                }
+                signedKeystores.put(psbtInput, inputSignatureKeystores);
+            }
+            return signedKeystores;
+        }
+
         for(PSBTInput psbtInput : signingNodes.keySet()) {
             WalletNode walletNode = signingNodes.get(psbtInput);
             Wallet signingWallet = walletNode.getWallet();
@@ -1808,10 +1875,56 @@ public class Wallet extends Persistable implements Comparable<Wallet> {
             }
         }
 
+        if(policyType == PolicyType.SINGLE_MLDSA) {
+            signBtq(psbt);
+            return;
+        }
+
         sign(getSigningNodes(psbt));
     }
 
+    /** Sign a Bitcoin Quantum P2MR PSBT: supply each input's leaf/root (a watch-only Core wallet cannot emit them) and ML-DSA sign. */
+    private void signBtq(PSBT psbt) {
+        signBtq(psbt, getSigningNodes(psbt));
+    }
+
+    private void signBtq(PSBT psbt, Map<PSBTInput, WalletNode> signingNodes) {
+        Keystore keystore = getKeystores().get(0);
+        Map<Integer, byte[]> inputSeeds = new LinkedHashMap<>();
+        try {
+            for(Map.Entry<PSBTInput, WalletNode> signingEntry : signingNodes.entrySet()) {
+                PSBTInput psbtInput = signingEntry.getKey();
+                WalletNode node = signingEntry.getValue();
+                if(psbtInput.isSigned()) {
+                    continue;
+                }
+                byte[] mldsaPubKey = keystore.getBtqPublicKey(node);
+                if(psbtInput.getP2mrLeafScript() == null) {
+                    byte[] leafScript = com.sparrowwallet.drongo.btq.P2MR.singleKeyLeafScript(mldsaPubKey);
+                    psbtInput.setP2mrLeaf(leafScript, (byte)com.sparrowwallet.drongo.btq.P2MR.LEAF_VERSION, com.sparrowwallet.drongo.btq.P2MR.singleLeafControlBlock());
+                    psbtInput.setP2mrMerkleRoot(com.sparrowwallet.drongo.btq.P2MR.tapLeafHash(leafScript));
+                }
+                inputSeeds.put(psbt.getPsbtInputs().indexOf(psbtInput), keystore.getBtqKeySeed(node.getKeyPurpose(), node.getIndex()));
+            }
+            if(!inputSeeds.isEmpty()) {
+                com.sparrowwallet.drongo.btq.BtqPsbtSigner.sign(psbt, inputSeeds);
+            }
+        } finally {
+            for(byte[] seed : inputSeeds.values()) {
+                java.util.Arrays.fill(seed, (byte)0);
+            }
+        }
+    }
+
     public void sign(Map<PSBTInput, WalletNode> signingNodes) throws MnemonicException {
+        if(policyType == PolicyType.SINGLE_MLDSA) {
+            //BTQ P2MR signing does not use per-keystore ECKeys; dispatch to the ML-DSA path
+            if(!signingNodes.isEmpty()) {
+                signBtq(signingNodes.keySet().iterator().next().getPsbt(), signingNodes);
+            }
+            return;
+        }
+
         for(Map.Entry<PSBTInput, WalletNode> signingEntry : signingNodes.entrySet()) {
             Wallet signingWallet = signingEntry.getValue().getWallet();
             for(Keystore keystore : signingWallet.getKeystores()) {
@@ -1966,6 +2079,11 @@ public class Wallet extends Persistable implements Comparable<Wallet> {
     }
 
     public void finalise(PSBT psbt) {
+        if(policyType == PolicyType.SINGLE_MLDSA) {
+            com.sparrowwallet.drongo.btq.BtqPsbtSigner.finaliseInputs(psbt);
+            return;
+        }
+
         int threshold = getDefaultPolicy().getNumSignaturesRequired();
         Map<PSBTInput, WalletNode> signingNodes = getSigningNodes(psbt);
 
@@ -2443,6 +2561,7 @@ public class Wallet extends Persistable implements Comparable<Wallet> {
         for(Keystore keystore : keystores) {
             keystore.decrypt(password);
         }
+        warmBtqKeyCache();
 
         for(Wallet childWallet : getChildWallets()) {
             if(childWallet.isNested()) {
@@ -2455,11 +2574,28 @@ public class Wallet extends Persistable implements Comparable<Wallet> {
         for(Keystore keystore : keystores) {
             keystore.decrypt(key);
         }
+        warmBtqKeyCache();
 
         for(Wallet childWallet : getChildWallets()) {
             if(childWallet.isNested()) {
                 childWallet.decrypt(key);
             }
+        }
+    }
+
+    /**
+     * Grow the ML-DSA public key cache to cover this wallet's look-ahead window whenever the master
+     * secret is available. The cache is what keeps addresses derivable while the wallet is encrypted,
+     * so it must track usage: the keystore's own warm floor cannot see used indexes.
+     */
+    private void warmBtqKeyCache() {
+        if(policyType != PolicyType.SINGLE_MLDSA || keystores.isEmpty()) {
+            return;
+        }
+        Keystore keystore = keystores.get(0);
+        for(KeyPurpose keyPurpose : getWalletKeyPurposes()) {
+            int keyCount = Math.max(Keystore.BTQ_CACHE_WARM_INDEXES, getLookAheadIndex(getNode(keyPurpose)) + 1);
+            keystore.warmBtqPublicKeyCache(network, keyPurpose, keyCount);
         }
     }
 

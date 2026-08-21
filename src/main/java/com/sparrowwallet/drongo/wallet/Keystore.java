@@ -6,7 +6,6 @@ import com.sparrowwallet.drongo.KeyPurpose;
 import com.sparrowwallet.drongo.Network;
 import com.sparrowwallet.drongo.Utils;
 import com.sparrowwallet.drongo.btq.BtqDerivation;
-import com.sparrowwallet.drongo.btq.Mldsa44;
 import com.sparrowwallet.drongo.bip47.PaymentAddress;
 import com.sparrowwallet.drongo.bip47.PaymentCode;
 import com.sparrowwallet.drongo.crypto.*;
@@ -181,27 +180,120 @@ public class Keystore extends Persistable {
     /**
      * The ML-DSA-44 public key for a BTQ custody wallet node, derived via HKDF from the master secret
      * and cached. BTQ has no public derivation, so an uncached key requires the decrypted master secret.
+     * <p>
+     * Returns null (never throws) when the key is uncached and the master secret is locked. This is safe:
+     * a wallet can only receive at an address it already derived and registered (which required the
+     * secret), so every <i>used</i> index is always cached; only unused gap-window addresses can be null.
      */
     public byte[] getBtqPublicKey(WalletNode walletNode) {
         return getBtqPublicKey(walletNode.getKeyPurpose(), walletNode.getIndex());
     }
 
     public byte[] getBtqPublicKey(KeyPurpose keyPurpose, int keyIndex) {
-        List<byte[]> cache = btqPublicKeyCache.computeIfAbsent(keyPurpose, purpose -> new ArrayList<>());
-        if(keyIndex < cache.size() && cache.get(keyIndex) != null) {
-            return cache.get(keyIndex);
-        }
+        synchronized(btqPublicKeyCache) {
+            List<byte[]> cache = btqPublicKeyCache.computeIfAbsent(keyPurpose, purpose -> new ArrayList<>());
+            if(keyIndex < cache.size() && cache.get(keyIndex) != null) {
+                return cache.get(keyIndex);
+            }
 
-        if(btqMasterSecret == null || btqMasterSecret.isEncrypted()) {
-            throw new IllegalStateException("BTQ master secret is not available to derive public keys");
-        }
+            if(btqMasterSecret == null || btqMasterSecret.isEncrypted()) {
+                return null;
+            }
 
-        byte[] publicKey = BtqDerivation.derivePublicKey(btqMasterSecret.getSecret(), Network.get(), BtqDerivation.Chain.fromKeyPurpose(keyPurpose), keyIndex);
-        while(cache.size() <= keyIndex) {
-            cache.add(null);
+            byte[] publicKey = BtqDerivation.derivePublicKey(btqMasterSecret.getSecret(), Network.get(), BtqDerivation.Chain.fromKeyPurpose(keyPurpose), keyIndex);
+            while(cache.size() <= keyIndex) {
+                cache.add(null);
+            }
+            cache.set(keyIndex, publicKey);
+            return publicKey;
         }
-        cache.set(keyIndex, publicKey);
-        return publicKey;
+    }
+
+    /**
+     * Merge cached ML-DSA public keys from another keystore into this one (e.g. from a decrypted signing
+     * copy whose cache grew, back into the encrypted original so the growth persists). Public keys only.
+     *
+     * @return true if any new entries were added
+     */
+    public boolean mergeBtqPublicKeyCache(Keystore other) {
+        boolean added = false;
+        synchronized(btqPublicKeyCache) {
+            synchronized(other.btqPublicKeyCache) {
+                for(Map.Entry<KeyPurpose, List<byte[]>> entry : other.btqPublicKeyCache.entrySet()) {
+                    List<byte[]> cache = btqPublicKeyCache.computeIfAbsent(entry.getKey(), purpose -> new ArrayList<>());
+                    List<byte[]> otherCache = entry.getValue();
+                    for(int keyIndex = 0; keyIndex < otherCache.size(); keyIndex++) {
+                        byte[] publicKey = otherCache.get(keyIndex);
+                        if(publicKey == null) {
+                            continue;
+                        }
+                        while(cache.size() <= keyIndex) {
+                            cache.add(null);
+                        }
+                        if(cache.get(keyIndex) == null) {
+                            cache.set(keyIndex, publicKey);
+                            added = true;
+                        }
+                    }
+                }
+            }
+        }
+        return added;
+    }
+
+    /**
+     * Encode the public key cache for persistence: version byte, then per chain [purpose ordinal, uint16
+     * count, count x 1312-byte keys]. Only the contiguous non-null prefix of each chain is written - the
+     * format is positional, so encoding past a hole would re-index later keys on decode.
+     */
+    public byte[] encodeBtqPublicKeyCache() {
+        synchronized(btqPublicKeyCache) {
+            if(btqPublicKeyCache.isEmpty()) {
+                return null;
+            }
+            java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream();
+            out.write(1);
+            for(Map.Entry<KeyPurpose, List<byte[]>> entry : btqPublicKeyCache.entrySet()) {
+                List<byte[]> keys = new ArrayList<>();
+                for(byte[] publicKey : entry.getValue()) {
+                    if(publicKey == null) {
+                        break;
+                    }
+                    keys.add(publicKey);
+                }
+                out.write(entry.getKey().ordinal());
+                out.write((keys.size() >> 8) & 0xff);
+                out.write(keys.size() & 0xff);
+                for(byte[] publicKey : keys) {
+                    out.writeBytes(publicKey);
+                }
+            }
+            return out.toByteArray();
+        }
+    }
+
+    /** Restore the public key cache from its persisted encoding. Unknown versions are ignored. */
+    public void decodeBtqPublicKeyCache(byte[] encoded) {
+        if(encoded == null || encoded.length < 1 || encoded[0] != 1) {
+            return;
+        }
+        int offset = 1;
+        while(offset + 3 <= encoded.length) {
+            KeyPurpose keyPurpose = KeyPurpose.values()[encoded[offset] & 0xff];
+            int count = ((encoded[offset + 1] & 0xff) << 8) | (encoded[offset + 2] & 0xff);
+            offset += 3;
+            List<byte[]> cache = btqPublicKeyCache.computeIfAbsent(keyPurpose, purpose -> new ArrayList<>());
+            for(int keyIndex = 0; keyIndex < count && offset + 1312 <= encoded.length; keyIndex++) {
+                byte[] publicKey = Arrays.copyOfRange(encoded, offset, offset + 1312);
+                offset += 1312;
+                while(cache.size() <= keyIndex) {
+                    cache.add(null);
+                }
+                if(cache.get(keyIndex) == null) {
+                    cache.set(keyIndex, publicKey);
+                }
+            }
+        }
     }
 
     /** The 32-byte ML-DSA key seed for a BTQ wallet node, for signing. The caller must zeroize it after use. */
@@ -520,6 +612,11 @@ public class Keystore extends Persistable {
         if(btqMasterSecret != null) {
             copy.setBtqMasterSecret(btqMasterSecret.copy());
         }
+        synchronized(btqPublicKeyCache) {
+            for(Map.Entry<KeyPurpose, List<byte[]>> cacheEntry : btqPublicKeyCache.entrySet()) {
+                copy.btqPublicKeyCache.put(cacheEntry.getKey(), new ArrayList<>(cacheEntry.getValue()));
+            }
+        }
         if(externalPaymentCode != null) {
             copy.setExternalPaymentCode(externalPaymentCode.copy());
         }
@@ -564,7 +661,39 @@ public class Keystore extends Persistable {
         byte[] fingerprint = Arrays.copyOf(Sha256Hash.hash(receiveKey), 4);
         keystore.setKeyDerivation(new KeyDerivation(Utils.bytesToHex(fingerprint), "m/0'"));
 
+        keystore.warmBtqPublicKeyCache(network, BTQ_CACHE_WARM_INDEXES);
         return keystore;
+    }
+
+    /**
+     * Derive and cache the first ML-DSA public keys of both chains while the master secret is available.
+     * BTQ has no public derivation, so the cache is what keeps addresses displayable while the keystore
+     * is encrypted; it is carried through copies and re-warmed on decrypt.
+     */
+    public void warmBtqPublicKeyCache(Network network, int keysPerChain) {
+        for(KeyPurpose keyPurpose : KeyPurpose.DEFAULT_PURPOSES) {
+            warmBtqPublicKeyCache(network, keyPurpose, keysPerChain);
+        }
+    }
+
+    /** Derive and cache the first {@code keyCount} ML-DSA public keys of one chain while the secret is available. */
+    public void warmBtqPublicKeyCache(Network network, KeyPurpose keyPurpose, int keyCount) {
+        if(btqMasterSecret == null || btqMasterSecret.isEncrypted()) {
+            return;
+        }
+        synchronized(btqPublicKeyCache) {
+            List<byte[]> cache = btqPublicKeyCache.computeIfAbsent(keyPurpose, purpose -> new ArrayList<>());
+            int target = Math.max(keyCount, cache.size());
+            for(int keyIndex = 0; keyIndex < target; keyIndex++) {
+                if(keyIndex >= cache.size() || cache.get(keyIndex) == null) {
+                    byte[] publicKey = BtqDerivation.derivePublicKey(btqMasterSecret.getSecret(), network, BtqDerivation.Chain.fromKeyPurpose(keyPurpose), keyIndex);
+                    while(cache.size() <= keyIndex) {
+                        cache.add(null);
+                    }
+                    cache.set(keyIndex, publicKey);
+                }
+            }
+        }
     }
 
     private static void rederiveKeystoreFromMaster(Keystore keystore, PolicyType policyType, List<ChildNumber> derivation) throws MnemonicException {
@@ -607,9 +736,15 @@ public class Keystore extends Persistable {
             masterPrivateExtendedKey = masterPrivateExtendedKey.encrypt(key);
         }
         if(hasBtqMasterSecret() && !btqMasterSecret.isEncrypted()) {
+            //Last moment the secret is available: ensure the public key cache covers the gap window so
+            //addresses stay displayable while encrypted, regardless of how this keystore was assembled
+            warmBtqPublicKeyCache(Network.get(), BTQ_CACHE_WARM_INDEXES);
             btqMasterSecret = btqMasterSecret.encrypt(key);
         }
     }
+
+    //Pre-derived ML-DSA public keys per chain, covering Sparrow's default gap limit
+    public static final int BTQ_CACHE_WARM_INDEXES = 21;
 
     public void decrypt(CharSequence password) {
         if(hasSeed() && seed.isEncrypted()) {
@@ -620,6 +755,7 @@ public class Keystore extends Persistable {
         }
         if(hasBtqMasterSecret() && btqMasterSecret.isEncrypted()) {
             btqMasterSecret = btqMasterSecret.decrypt(password);
+            warmBtqPublicKeyCache(Network.get(), BTQ_CACHE_WARM_INDEXES);
         }
     }
 
@@ -632,6 +768,7 @@ public class Keystore extends Persistable {
         }
         if(hasBtqMasterSecret() && btqMasterSecret.isEncrypted()) {
             btqMasterSecret = btqMasterSecret.decrypt(key);
+            warmBtqPublicKeyCache(Network.get(), BTQ_CACHE_WARM_INDEXES);
         }
     }
 

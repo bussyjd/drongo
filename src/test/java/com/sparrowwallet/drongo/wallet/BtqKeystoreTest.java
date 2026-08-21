@@ -32,7 +32,7 @@ public class BtqKeystoreTest {
 
     @Test
     public void testFromBtqMasterSecret() throws InvalidKeystoreException {
-        Keystore keystore = Keystore.fromBtqMasterSecret(master(), Network.TESTNET);
+        Keystore keystore = Keystore.fromBtqMasterSecret(master(), Network.get());
         Assertions.assertEquals(KeystoreSource.SW_BTQ_SEED, keystore.getSource());
         Assertions.assertEquals(WalletModel.BTQ_CORE, keystore.getWalletModel());
         Assertions.assertTrue(keystore.hasBtqMasterSecret());
@@ -45,7 +45,7 @@ public class BtqKeystoreTest {
 
     @Test
     public void testBtqPublicKeyDerivationAndCache() {
-        Keystore keystore = Keystore.fromBtqMasterSecret(master(), Network.TESTNET);
+        Keystore keystore = Keystore.fromBtqMasterSecret(master(), Network.get());
         byte[] receive0 = keystore.getBtqPublicKey(KeyPurpose.RECEIVE, 0);
         byte[] change0 = keystore.getBtqPublicKey(KeyPurpose.CHANGE, 0);
         Assertions.assertEquals(Mldsa44.PUBLIC_KEY_BYTES, receive0.length);
@@ -60,17 +60,19 @@ public class BtqKeystoreTest {
 
     @Test
     public void testEncryptDecryptLifecycle() throws InvalidKeystoreException {
-        Keystore keystore = Keystore.fromBtqMasterSecret(master(), Network.TESTNET);
+        Keystore keystore = Keystore.fromBtqMasterSecret(master(), Network.get());
         byte[] receive0 = keystore.getBtqPublicKey(KeyPurpose.RECEIVE, 0);
         Key key = testKey();
 
         keystore.encrypt(key);
         Assertions.assertTrue(keystore.isEncrypted());
         keystore.checkKeystore(); //valid while encrypted
-        //Cached public keys remain available while locked
+        //The pre-warmed cache keeps the gap window readable while locked
         Assertions.assertArrayEquals(receive0, keystore.getBtqPublicKey(KeyPurpose.RECEIVE, 0));
-        //But new derivations require the secret
-        Assertions.assertThrows(IllegalStateException.class, () -> keystore.getBtqPublicKey(KeyPurpose.RECEIVE, 1));
+        Assertions.assertEquals(Mldsa44.PUBLIC_KEY_BYTES, keystore.getBtqPublicKey(KeyPurpose.RECEIVE, Keystore.BTQ_CACHE_WARM_INDEXES - 1).length);
+        //Beyond the warmed window a locked wallet returns null (never throws) — the address is an unused gap-window node
+        Assertions.assertNull(keystore.getBtqPublicKey(KeyPurpose.RECEIVE, Keystore.BTQ_CACHE_WARM_INDEXES));
+        //Signing still requires the secret
         Assertions.assertThrows(IllegalStateException.class, () -> keystore.getBtqKeySeed(KeyPurpose.RECEIVE, 0));
 
         keystore.decrypt(key);
@@ -83,7 +85,7 @@ public class BtqKeystoreTest {
 
     @Test
     public void testCopyAndClear() {
-        Keystore keystore = Keystore.fromBtqMasterSecret(master(), Network.TESTNET);
+        Keystore keystore = Keystore.fromBtqMasterSecret(master(), Network.get());
         Keystore copy = keystore.copy();
         Assertions.assertTrue(copy.hasBtqMasterSecret());
         Assertions.assertArrayEquals(master(), copy.getBtqMasterSecret().getSecret());
@@ -96,7 +98,7 @@ public class BtqKeystoreTest {
 
     @Test
     public void testCheckKeystoreRejectsMissingSecret() {
-        Keystore keystore = Keystore.fromBtqMasterSecret(master(), Network.TESTNET);
+        Keystore keystore = Keystore.fromBtqMasterSecret(master(), Network.get());
         keystore.setBtqMasterSecret(null);
         Assertions.assertThrows(InvalidKeystoreException.class, keystore::checkKeystore);
     }
