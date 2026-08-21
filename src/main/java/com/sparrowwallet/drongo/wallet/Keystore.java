@@ -191,40 +191,86 @@ public class Keystore extends Persistable {
     }
 
     public byte[] getBtqPublicKey(KeyPurpose keyPurpose, int keyIndex) {
-        List<byte[]> cache = btqPublicKeyCache.computeIfAbsent(keyPurpose, purpose -> new ArrayList<>());
-        if(keyIndex < cache.size() && cache.get(keyIndex) != null) {
-            return cache.get(keyIndex);
-        }
+        synchronized(btqPublicKeyCache) {
+            List<byte[]> cache = btqPublicKeyCache.computeIfAbsent(keyPurpose, purpose -> new ArrayList<>());
+            if(keyIndex < cache.size() && cache.get(keyIndex) != null) {
+                return cache.get(keyIndex);
+            }
 
-        if(btqMasterSecret == null || btqMasterSecret.isEncrypted()) {
-            return null;
-        }
+            if(btqMasterSecret == null || btqMasterSecret.isEncrypted()) {
+                return null;
+            }
 
-        byte[] publicKey = BtqDerivation.derivePublicKey(btqMasterSecret.getSecret(), Network.get(), BtqDerivation.Chain.fromKeyPurpose(keyPurpose), keyIndex);
-        while(cache.size() <= keyIndex) {
-            cache.add(null);
+            byte[] publicKey = BtqDerivation.derivePublicKey(btqMasterSecret.getSecret(), Network.get(), BtqDerivation.Chain.fromKeyPurpose(keyPurpose), keyIndex);
+            while(cache.size() <= keyIndex) {
+                cache.add(null);
+            }
+            cache.set(keyIndex, publicKey);
+            return publicKey;
         }
-        cache.set(keyIndex, publicKey);
-        return publicKey;
     }
 
-    /** Encode the public key cache for persistence: version byte, then per chain [purpose ordinal, uint16 count, count x 1312-byte keys]. */
-    public byte[] encodeBtqPublicKeyCache() {
-        if(btqPublicKeyCache.isEmpty()) {
-            return null;
-        }
-        java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream();
-        out.write(1);
-        for(Map.Entry<KeyPurpose, List<byte[]>> entry : btqPublicKeyCache.entrySet()) {
-            List<byte[]> keys = entry.getValue().stream().filter(Objects::nonNull).toList();
-            out.write(entry.getKey().ordinal());
-            out.write((keys.size() >> 8) & 0xff);
-            out.write(keys.size() & 0xff);
-            for(byte[] publicKey : keys) {
-                out.writeBytes(publicKey);
+    /**
+     * Merge cached ML-DSA public keys from another keystore into this one (e.g. from a decrypted signing
+     * copy whose cache grew, back into the encrypted original so the growth persists). Public keys only.
+     *
+     * @return true if any new entries were added
+     */
+    public boolean mergeBtqPublicKeyCache(Keystore other) {
+        boolean added = false;
+        synchronized(btqPublicKeyCache) {
+            synchronized(other.btqPublicKeyCache) {
+                for(Map.Entry<KeyPurpose, List<byte[]>> entry : other.btqPublicKeyCache.entrySet()) {
+                    List<byte[]> cache = btqPublicKeyCache.computeIfAbsent(entry.getKey(), purpose -> new ArrayList<>());
+                    List<byte[]> otherCache = entry.getValue();
+                    for(int keyIndex = 0; keyIndex < otherCache.size(); keyIndex++) {
+                        byte[] publicKey = otherCache.get(keyIndex);
+                        if(publicKey == null) {
+                            continue;
+                        }
+                        while(cache.size() <= keyIndex) {
+                            cache.add(null);
+                        }
+                        if(cache.get(keyIndex) == null) {
+                            cache.set(keyIndex, publicKey);
+                            added = true;
+                        }
+                    }
+                }
             }
         }
-        return out.toByteArray();
+        return added;
+    }
+
+    /**
+     * Encode the public key cache for persistence: version byte, then per chain [purpose ordinal, uint16
+     * count, count x 1312-byte keys]. Only the contiguous non-null prefix of each chain is written - the
+     * format is positional, so encoding past a hole would re-index later keys on decode.
+     */
+    public byte[] encodeBtqPublicKeyCache() {
+        synchronized(btqPublicKeyCache) {
+            if(btqPublicKeyCache.isEmpty()) {
+                return null;
+            }
+            java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream();
+            out.write(1);
+            for(Map.Entry<KeyPurpose, List<byte[]>> entry : btqPublicKeyCache.entrySet()) {
+                List<byte[]> keys = new ArrayList<>();
+                for(byte[] publicKey : entry.getValue()) {
+                    if(publicKey == null) {
+                        break;
+                    }
+                    keys.add(publicKey);
+                }
+                out.write(entry.getKey().ordinal());
+                out.write((keys.size() >> 8) & 0xff);
+                out.write(keys.size() & 0xff);
+                for(byte[] publicKey : keys) {
+                    out.writeBytes(publicKey);
+                }
+            }
+            return out.toByteArray();
+        }
     }
 
     /** Restore the public key cache from its persisted encoding. Unknown versions are ignored. */
@@ -624,12 +670,19 @@ public class Keystore extends Persistable {
      * is encrypted; it is carried through copies and re-warmed on decrypt.
      */
     public void warmBtqPublicKeyCache(Network network, int keysPerChain) {
+        for(KeyPurpose keyPurpose : KeyPurpose.DEFAULT_PURPOSES) {
+            warmBtqPublicKeyCache(network, keyPurpose, keysPerChain);
+        }
+    }
+
+    /** Derive and cache the first {@code keyCount} ML-DSA public keys of one chain while the secret is available. */
+    public void warmBtqPublicKeyCache(Network network, KeyPurpose keyPurpose, int keyCount) {
         if(btqMasterSecret == null || btqMasterSecret.isEncrypted()) {
             return;
         }
-        for(KeyPurpose keyPurpose : KeyPurpose.DEFAULT_PURPOSES) {
+        synchronized(btqPublicKeyCache) {
             List<byte[]> cache = btqPublicKeyCache.computeIfAbsent(keyPurpose, purpose -> new ArrayList<>());
-            int target = Math.max(keysPerChain, cache.size());
+            int target = Math.max(keyCount, cache.size());
             for(int keyIndex = 0; keyIndex < target; keyIndex++) {
                 if(keyIndex >= cache.size() || cache.get(keyIndex) == null) {
                     byte[] publicKey = BtqDerivation.derivePublicKey(btqMasterSecret.getSecret(), network, BtqDerivation.Chain.fromKeyPurpose(keyPurpose), keyIndex);

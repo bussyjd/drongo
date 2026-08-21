@@ -392,6 +392,10 @@ public class PSBTInput {
                     if(leafValue.length < 1) {
                         throw new PSBTParseException("PSBT input P2MR leaf script entry must contain at least the leaf version byte");
                     }
+                    if(entry.getKeyData() == null || entry.getKeyData().length == 0) {
+                        //An empty key would silently produce an unspendable final witness; btq-core rejects this too
+                        throw new PSBTParseException("PSBT input P2MR leaf script entry must carry a control block in its key");
+                    }
                     this.p2mrControlBlock = entry.getKeyData();
                     this.p2mrLeafScript = Arrays.copyOf(leafValue, leafValue.length - 1);
                     this.p2mrLeafVersion = leafValue[leafValue.length - 1];

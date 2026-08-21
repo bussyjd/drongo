@@ -1047,7 +1047,7 @@ public class Wallet extends Persistable implements Comparable<Wallet> {
      * @return the number of vBytes
      */
     /** The virtual size of a constructed transaction, honouring Bitcoin Quantum's witness scale factor of 16. */
-    private double getVirtualSize(Transaction transaction) {
+    public double getVirtualSize(Transaction transaction) {
         if(policyType == PolicyType.SINGLE_MLDSA) {
             //BTQ weight = stripped_size * 15 + total_size; vsize = weight / 16
             int totalSize = transaction.bitcoinSerialize().length;
@@ -1270,7 +1270,12 @@ public class Wallet extends Persistable implements Comparable<Wallet> {
                         changeNode = getFreshNode(getChangeKeyPurpose(), changeNode);
                     }
                     for(Long setChangeAmt : setChangeAmts) {
-                        TransactionOutput output = transaction.addOutput(setChangeAmt, changeNode.getOutputScript());
+                        Script changeScript = changeNode.getOutputScript();
+                        if(changeScript == null) {
+                            throw new IllegalStateException("Cannot derive the BTQ change address at index " + changeNode.getIndex() +
+                                    " while the wallet is locked. Unlock the wallet (open Settings and enter the password) to extend the key cache, then retry.");
+                        }
+                        TransactionOutput output = transaction.addOutput(setChangeAmt, changeScript);
                         outputs.add(new WalletTransaction.ChangeOutput(output, changeNode, setChangeAmt));
                         changeMap.put(changeNode, setChangeAmt);
                         changeNode = getFreshNode(getChangeKeyPurpose(), changeNode);
@@ -1429,6 +1434,11 @@ public class Wallet extends Persistable implements Comparable<Wallet> {
 
     private void getGroupedUtxos(List<OutputGroup> outputGroups, WalletNode purposeNode, List<TxoFilter> txoFilters, Map<Sha256Hash, BlockTransaction> walletTransactions, Map<BlockTransactionHashIndex, WalletNode> walletTxos, double feeRate, double longTermFeeRate, boolean groupByAddress) {
         int inputWeightUnits = getInputWeightUnits();
+        if(policyType == PolicyType.SINGLE_MLDSA) {
+            //OutputGroup divides weight by the Bitcoin witness scale factor; normalise the scale-16
+            //weight so each P2MR input's effective fee cost is its true vsize, not 4x it
+            inputWeightUnits = getInputVbytes() * WITNESS_SCALE_FACTOR;
+        }
         for(WalletNode addressNode : purposeNode.getChildren()) {
             OutputGroup outputGroup = null;
             for(BlockTransactionHashIndex utxo : addressNode.getTransactionOutputs(txoFilters)) {
@@ -2545,6 +2555,7 @@ public class Wallet extends Persistable implements Comparable<Wallet> {
         for(Keystore keystore : keystores) {
             keystore.decrypt(password);
         }
+        warmBtqKeyCache();
 
         for(Wallet childWallet : getChildWallets()) {
             if(childWallet.isNested()) {
@@ -2557,11 +2568,28 @@ public class Wallet extends Persistable implements Comparable<Wallet> {
         for(Keystore keystore : keystores) {
             keystore.decrypt(key);
         }
+        warmBtqKeyCache();
 
         for(Wallet childWallet : getChildWallets()) {
             if(childWallet.isNested()) {
                 childWallet.decrypt(key);
             }
+        }
+    }
+
+    /**
+     * Grow the ML-DSA public key cache to cover this wallet's look-ahead window whenever the master
+     * secret is available. The cache is what keeps addresses derivable while the wallet is encrypted,
+     * so it must track usage: the keystore's own warm floor cannot see used indexes.
+     */
+    private void warmBtqKeyCache() {
+        if(policyType != PolicyType.SINGLE_MLDSA || keystores.isEmpty()) {
+            return;
+        }
+        Keystore keystore = keystores.get(0);
+        for(KeyPurpose keyPurpose : getWalletKeyPurposes()) {
+            int keyCount = Math.max(Keystore.BTQ_CACHE_WARM_INDEXES, getLookAheadIndex(getNode(keyPurpose)) + 1);
+            keystore.warmBtqPublicKeyCache(network, keyPurpose, keyCount);
         }
     }
 

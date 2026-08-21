@@ -101,6 +101,10 @@ public class WalletTransaction {
     }
 
     public double getFeeRate() {
+        if(wallet != null && wallet.getPolicyType() == PolicyType.SINGLE_MLDSA) {
+            //BTQ transactions weigh at witness scale 16; the Transaction class computes scale-4 vsize
+            return (double)fee / wallet.getVirtualSize(transaction);
+        }
         return (double)fee / transaction.getVirtualSize();
     }
 
