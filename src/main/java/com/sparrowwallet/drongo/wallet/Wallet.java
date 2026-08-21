@@ -1523,7 +1523,9 @@ public class Wallet extends Persistable implements Comparable<Wallet> {
         Map<Wallet, Integer> cachedInputWeightUnits = new HashMap<>();
         Transaction transaction = new Transaction();
         for(Map.Entry<BlockTransactionHashIndex, WalletNode> utxo : availableTxos.entrySet()) {
-            int inputWeightUnits = cachedInputWeightUnits.computeIfAbsent(utxo.getValue().getWallet(), Wallet::getInputWeightUnits);
+            //Mirror getGroupedUtxos: normalise scale-16 P2MR weight so the scale-4 division below yields true vbytes
+            int inputWeightUnits = cachedInputWeightUnits.computeIfAbsent(utxo.getValue().getWallet(),
+                    utxoWallet -> utxoWallet.getPolicyType() == PolicyType.SINGLE_MLDSA ? utxoWallet.getInputVbytes() * WITNESS_SCALE_FACTOR : utxoWallet.getInputWeightUnits());
             long minInputValue = (long)Math.ceil(feeRate * inputWeightUnits / WITNESS_SCALE_FACTOR);
             if(utxo.getKey().getValue() > minInputValue) {
                 Transaction prevTx = getWalletTransaction(utxo.getKey().getHash()).getTransaction();

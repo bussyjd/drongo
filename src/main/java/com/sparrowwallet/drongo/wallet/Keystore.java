@@ -612,8 +612,10 @@ public class Keystore extends Persistable {
         if(btqMasterSecret != null) {
             copy.setBtqMasterSecret(btqMasterSecret.copy());
         }
-        for(Map.Entry<KeyPurpose, List<byte[]>> cacheEntry : btqPublicKeyCache.entrySet()) {
-            copy.btqPublicKeyCache.put(cacheEntry.getKey(), new ArrayList<>(cacheEntry.getValue()));
+        synchronized(btqPublicKeyCache) {
+            for(Map.Entry<KeyPurpose, List<byte[]>> cacheEntry : btqPublicKeyCache.entrySet()) {
+                copy.btqPublicKeyCache.put(cacheEntry.getKey(), new ArrayList<>(cacheEntry.getValue()));
+            }
         }
         if(externalPaymentCode != null) {
             copy.setExternalPaymentCode(externalPaymentCode.copy());
