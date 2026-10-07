@@ -1,6 +1,7 @@
 package com.sparrowwallet.drongo.btq;
 
 import com.sparrowwallet.drongo.protocol.Script;
+import com.sparrowwallet.drongo.protocol.ScriptType;
 import com.sparrowwallet.drongo.protocol.Sha256Hash;
 import com.sparrowwallet.drongo.protocol.SigHash;
 import com.sparrowwallet.drongo.protocol.Transaction;
@@ -105,6 +106,66 @@ public final class BtqPsbtSigner {
         if(!Mldsa44.verifyTransactionHash(publicKey, sighash, signature)) {
             throw new PSBTSignatureException("P2MR input " + inputIndex + " is finalized with an ML-DSA signature that does not verify");
         }
+    }
+
+    /**
+     * Verify the BIP360 Dilithium script signature (field 0x1b) an input carries, if any, as a PSBT is parsed or combined. The
+     * signature must be keyed to the input's own leaf script, that leaf must be committed to by the input's P2MR UTXO through its
+     * control block, the leaf must push the signing public key, and the ML-DSA-44 signature must verify over the SIGHASH_ALL
+     * P2MR sighash. Anything that cannot be checked fails closed, as an unverifiable ECDSA or Schnorr signature does.
+     *
+     * @throws PSBTSignatureException if the input's Dilithium signature is unverifiable or does not verify
+     */
+    public static void verifyDilithiumSignature(PSBT psbt, int inputIndex) throws PSBTSignatureException {
+        PSBTInput input = psbt.getPsbtInputs().get(inputIndex);
+        byte[] signature = input.getP2mrDilithiumSignature();
+        if(signature == null) {
+            return;
+        }
+
+        TransactionOutput witnessUtxo = input.getWitnessUtxo();
+        if(witnessUtxo == null || !ScriptType.P2MR.isScriptType(witnessUtxo.getScript())) {
+            throw new PSBTSignatureException("Input " + inputIndex + " provides a Dilithium signature but no P2MR witness UTXO to verify it against");
+        }
+        byte[] leafScript = input.getP2mrLeafScript();
+        if(leafScript == null) {
+            throw new PSBTSignatureException("P2MR input " + inputIndex + " provides a Dilithium signature without the leaf script it signs");
+        }
+        if(!Arrays.equals(P2MR.tapLeafHash(leafScript), input.getP2mrDilithiumLeafHash())) {
+            throw new PSBTSignatureException("P2MR input " + inputIndex + " provides a Dilithium signature for a leaf other than its leaf script");
+        }
+        byte[] merkleRoot = P2MR.merkleRootFromControlBlock(leafScript, input.getP2mrControlBlock());
+        if(merkleRoot == null || !Arrays.equals(P2MR.outputScript(merkleRoot), witnessUtxo.getScript().getProgram())) {
+            throw new PSBTSignatureException("P2MR input " + inputIndex + " provides a Dilithium signature for a leaf its UTXO does not commit to");
+        }
+        byte[] publicKey = input.getP2mrDilithiumPubKey();
+        if(!containsPublicKeyPush(leafScript, publicKey)) {
+            throw new PSBTSignatureException("P2MR input " + inputIndex + " provides a Dilithium signature from a key its leaf script does not contain");
+        }
+
+        byte[] sighash;
+        try {
+            sighash = sighash(psbt, inputIndex, leafScript);
+        } catch(IllegalStateException e) {
+            throw new PSBTSignatureException("Unverifiable Dilithium signature provided for P2MR input " + inputIndex + ": " + e.getMessage());
+        }
+        if(!Mldsa44.verifyTransactionHash(publicKey, sighash, signature)) {
+            throw new PSBTSignatureException("Dilithium signature does not verify against the provided public key for P2MR input " + inputIndex);
+        }
+    }
+
+    /** Whether the leaf script pushes the given ML-DSA public key with the {@code OP_PUSHDATA2 <1312>} encoding a Dilithium leaf uses. */
+    private static boolean containsPublicKeyPush(byte[] leafScript, byte[] publicKey) {
+        if(publicKey == null || publicKey.length != Mldsa44.PUBLIC_KEY_BYTES) {
+            return false;
+        }
+        byte[] push = Arrays.copyOf(P2MR.singleKeyLeafScript(publicKey), 3 + publicKey.length);
+        for(int offset = 0; offset + push.length <= leafScript.length; offset++) {
+            if(Arrays.equals(leafScript, offset, offset + push.length, push, 0, push.length)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**

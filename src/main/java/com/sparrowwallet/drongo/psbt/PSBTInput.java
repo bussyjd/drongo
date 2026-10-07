@@ -487,6 +487,27 @@ public class PSBTInput {
                 throw new PSBTParseException("Witness script hash does not match provided pay to script hash " + Utils.bytesToHex(pubKeyHash));
             }
         }
+
+        //A P2MR utxo's witness program is the Merkle root of its script tree, so a leaf script must be proven part of that tree by its control block
+        if(p2mrLeafScript != null || p2mrMerkleRoot != null) {
+            if(scriptPubKey == null) {
+                log.warn("PSBT provided P2MR fields for a transaction output that was not provided");
+            } else if(!P2MR.isScriptType(scriptPubKey)) {
+                throw new PSBTParseException("PSBT provided P2MR fields for a transaction output that is not P2MR");
+            } else {
+                byte[] scriptPubKeyProgram = scriptPubKey.getProgram();
+                if(p2mrMerkleRoot != null && !Arrays.equals(com.sparrowwallet.drongo.btq.P2MR.outputScript(p2mrMerkleRoot), scriptPubKeyProgram)) {
+                    throw new PSBTParseException("P2MR merkle root does not match the transaction output script pubkey for input " + index);
+                }
+                if(p2mrLeafScript != null) {
+                    byte[] merkleRoot = com.sparrowwallet.drongo.btq.P2MR.merkleRootFromControlBlock(p2mrLeafScript, p2mrControlBlock);
+                    if((p2mrLeafVersion & 0xff) != com.sparrowwallet.drongo.btq.P2MR.LEAF_VERSION || merkleRoot == null
+                            || !Arrays.equals(com.sparrowwallet.drongo.btq.P2MR.outputScript(merkleRoot), scriptPubKeyProgram)) {
+                        throw new PSBTParseException("P2MR leaf script and control block are not committed to by the transaction output script pubkey for input " + index);
+                    }
+                }
+            }
+        }
     }
 
     private TransactionOutput getNonWitnessUtxoOutput() {
@@ -1149,6 +1170,12 @@ public class PSBTInput {
     }
 
     boolean verifySignatures() throws PSBTSignatureException {
+        //A Bitcoin Quantum P2MR input carries an ML-DSA signature (field 0x1b) rather than ECDSA or Schnorr partial signatures
+        if(p2mrDilithiumSignature != null || (getUtxo() != null && P2MR.isScriptType(getUtxo().getScript()))) {
+            com.sparrowwallet.drongo.btq.BtqPsbtSigner.verifyDilithiumSignature(psbt, index);
+            return true;
+        }
+
         SigHash localSigHash = getSigHash();
         if(localSigHash == null) {
             localSigHash = getDefaultSigHash();

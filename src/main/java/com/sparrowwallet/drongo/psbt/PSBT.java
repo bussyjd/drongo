@@ -1073,6 +1073,16 @@ public class PSBT {
             if(isReplacement(psbtInput.getWitnessScript(), combinedInput.getWitnessScript())) {
                 throw new PSBTSignatureException("Combined PSBT would change the witness script of input " + i);
             }
+
+            //A P2MR utxo commits to its script tree, so a combine that replaced the leaf being spent would have the ML-DSA signature still to be collected made over a different leaf
+            if(psbtInput.getP2mrLeafScript() != null && combinedInput.getP2mrLeafScript() != null
+                    && (!Arrays.equals(psbtInput.getP2mrLeafScript(), combinedInput.getP2mrLeafScript()) || psbtInput.getP2mrLeafVersion() != combinedInput.getP2mrLeafVersion()
+                    || !Arrays.equals(psbtInput.getP2mrControlBlock(), combinedInput.getP2mrControlBlock()))) {
+                throw new PSBTSignatureException("Combined PSBT would change the P2MR leaf script or control block of input " + i);
+            }
+            if(psbtInput.getP2mrMerkleRoot() != null && combinedInput.getP2mrMerkleRoot() != null && !Arrays.equals(psbtInput.getP2mrMerkleRoot(), combinedInput.getP2mrMerkleRoot())) {
+                throw new PSBTSignatureException("Combined PSBT would change the P2MR merkle root of input " + i);
+            }
         }
     }
 

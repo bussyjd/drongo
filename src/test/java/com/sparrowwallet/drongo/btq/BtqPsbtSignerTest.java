@@ -208,4 +208,153 @@ public class BtqPsbtSignerTest {
         Assertions.assertNull(P2MR.publicKeyFromSingleKeyLeafScript(leaf));
         Assertions.assertArrayEquals(Mldsa44.publicKeyFromSeed(seed), P2MR.publicKeyFromSingleKeyLeafScript(pushes.get(1)));
     }
+
+    /** The fixed PSBT for the seed's key carrying its BIP360 0x1b Dilithium signature, as a co-signer or Core would return it unfinalized. */
+    private static PSBT signedPsbt(byte[] seed) {
+        PSBT psbt = buildFixedPsbt(Mldsa44.publicKeyFromSeed(seed));
+        BtqPsbtSigner.sign(psbt, Map.of(0, seed));
+        return psbt;
+    }
+
+    private static void tamperDilithiumSignature(PSBT psbt) {
+        PSBTInput input = psbt.getPsbtInputs().get(0);
+        byte[] signature = input.getP2mrDilithiumSignature().clone();
+        signature[100] ^= 0x01;
+        input.setP2mrDilithiumSignature(input.getP2mrDilithiumPubKey(), input.getP2mrDilithiumLeafHash(), signature);
+    }
+
+    @Test
+    public void testParseVerifiesDilithiumSignature() throws Exception {
+        PSBT parsed = new PSBT(signedPsbt(testSeed(0x30)).serialize(), true);
+        Assertions.assertTrue(parsed.getPsbtInputs().get(0).isSigned());
+    }
+
+    @Test
+    public void testParseRejectsTamperedDilithiumSignature() {
+        PSBT signed = signedPsbt(testSeed(0x30));
+        tamperDilithiumSignature(signed);
+        byte[] serialized = signed.serialize();
+        PSBTSignatureException e = Assertions.assertThrows(PSBTSignatureException.class, () -> new PSBT(serialized, true));
+        Assertions.assertTrue(e.getMessage().contains("does not verify"), e.getMessage());
+    }
+
+    @Test
+    public void testParseRejectsDilithiumSignatureForAnotherLeaf() {
+        //The 0x1b key must name the leaf hash of the input's own leaf script
+        byte[] seed = testSeed(0x30);
+        PSBT signed = signedPsbt(seed);
+        PSBTInput input = signed.getPsbtInputs().get(0);
+        byte[] otherLeafHash = P2MR.tapLeafHash(P2MR.singleKeyLeafScript(Mldsa44.publicKeyFromSeed(testSeed(0x50))));
+        input.setP2mrDilithiumSignature(input.getP2mrDilithiumPubKey(), otherLeafHash, input.getP2mrDilithiumSignature());
+        byte[] serialized = signed.serialize();
+        PSBTSignatureException e = Assertions.assertThrows(PSBTSignatureException.class, () -> new PSBT(serialized, true));
+        Assertions.assertTrue(e.getMessage().contains("leaf other than"), e.getMessage());
+    }
+
+    @Test
+    public void testParseRejectsLeafTheUtxoDoesNotCommitTo() {
+        PSBT psbt = buildFixedPsbt(Mldsa44.publicKeyFromSeed(testSeed(0x30)));
+        byte[] otherLeaf = P2MR.singleKeyLeafScript(Mldsa44.publicKeyFromSeed(testSeed(0x50)));
+        psbt.getPsbtInputs().get(0).setP2mrLeaf(otherLeaf, (byte)P2MR.LEAF_VERSION, P2MR.singleLeafControlBlock());
+        byte[] serialized = psbt.serialize();
+        Assertions.assertThrows(com.sparrowwallet.drongo.psbt.PSBTParseException.class, () -> new PSBT(serialized, false));
+    }
+
+    @Test
+    public void testParseRejectsMerkleRootTheUtxoDoesNotCommitTo() {
+        PSBT psbt = buildFixedPsbt(Mldsa44.publicKeyFromSeed(testSeed(0x30)));
+        psbt.getPsbtInputs().get(0).setP2mrMerkleRoot(new byte[32]);
+        byte[] serialized = psbt.serialize();
+        Assertions.assertThrows(com.sparrowwallet.drongo.psbt.PSBTParseException.class, () -> new PSBT(serialized, false));
+    }
+
+    @Test
+    public void testCombineAcceptsCosignerDilithiumSignature() throws Exception {
+        byte[] seed = testSeed(0x30);
+        PSBT open = buildFixedPsbt(Mldsa44.publicKeyFromSeed(seed));
+        PSBT combined = open.verifyCombinedSignatures(signedPsbt(seed));
+        Assertions.assertTrue(combined.getPsbtInputs().get(0).isSigned());
+    }
+
+    @Test
+    public void testCombineRejectsTamperedDilithiumSignature() {
+        byte[] seed = testSeed(0x30);
+        PSBT open = buildFixedPsbt(Mldsa44.publicKeyFromSeed(seed));
+        PSBT signed = signedPsbt(seed);
+        tamperDilithiumSignature(signed);
+        PSBTSignatureException e = Assertions.assertThrows(PSBTSignatureException.class, () -> open.verifyCombinedSignatures(signed));
+        Assertions.assertTrue(e.getMessage().contains("does not verify"), e.getMessage());
+    }
+
+    @Test
+    public void testCombineRejectsReplacedLeafScript() {
+        //A combine must not swap the leaf the open PSBT is collecting a signature over, even for one the other party has signed
+        byte[] seed = testSeed(0x30);
+        byte[] otherSeed = testSeed(0x50);
+        PSBT open = buildFixedPsbt(Mldsa44.publicKeyFromSeed(seed));
+        PSBT other = open.copy();
+        other.getPsbtInputs().get(0).setP2mrLeaf(P2MR.singleKeyLeafScript(Mldsa44.publicKeyFromSeed(otherSeed)), (byte)P2MR.LEAF_VERSION, P2MR.singleLeafControlBlock());
+        PSBTSignatureException e = Assertions.assertThrows(PSBTSignatureException.class, () -> open.verifyCombinedSignatures(other));
+        Assertions.assertTrue(e.getMessage().contains("P2MR leaf script"), e.getMessage());
+    }
+
+    @Test
+    public void testCombineRejectsReplacedMerkleRoot() {
+        PSBT open = buildFixedPsbt(Mldsa44.publicKeyFromSeed(testSeed(0x30)));
+        PSBT other = open.copy();
+        other.getPsbtInputs().get(0).setP2mrMerkleRoot(new byte[32]);
+        PSBTSignatureException e = Assertions.assertThrows(PSBTSignatureException.class, () -> open.verifyCombinedSignatures(other));
+        Assertions.assertTrue(e.getMessage().contains("merkle root"), e.getMessage());
+    }
+
+    @Test
+    public void testMerkleRootFromControlBlockFoldsSortedBranches() {
+        byte[] leafA = P2MR.singleKeyLeafScript(Mldsa44.publicKeyFromSeed(testSeed(0x30)));
+        byte[] leafB = P2MR.singleKeyLeafScript(Mldsa44.publicKeyFromSeed(testSeed(0x50)));
+        byte[] hashA = P2MR.tapLeafHash(leafA);
+        byte[] hashB = P2MR.tapLeafHash(leafB);
+        byte[] root = P2MR.tapBranchHash(hashA, hashB);
+        Assertions.assertArrayEquals(root, P2MR.tapBranchHash(hashB, hashA));
+
+        byte[] controlA = new byte[33];
+        controlA[0] = (byte)P2MR.CONTROL_BYTE;
+        System.arraycopy(hashB, 0, controlA, 1, 32);
+        byte[] controlB = new byte[33];
+        controlB[0] = (byte)P2MR.CONTROL_BYTE;
+        System.arraycopy(hashA, 0, controlB, 1, 32);
+        Assertions.assertArrayEquals(root, P2MR.merkleRootFromControlBlock(leafA, controlA));
+        Assertions.assertArrayEquals(root, P2MR.merkleRootFromControlBlock(leafB, controlB));
+        Assertions.assertArrayEquals(hashA, P2MR.merkleRootFromControlBlock(leafA, P2MR.singleLeafControlBlock()));
+
+        //BIP360 requires the parity bit, and a control block is one byte plus whole 32-byte nodes
+        byte[] noParity = controlA.clone();
+        noParity[0] = (byte)P2MR.LEAF_VERSION;
+        Assertions.assertNull(P2MR.merkleRootFromControlBlock(leafA, noParity));
+        Assertions.assertNull(P2MR.merkleRootFromControlBlock(leafA, Arrays.copyOf(controlA, 32)));
+        Assertions.assertNull(P2MR.merkleRootFromControlBlock(leafA, new byte[0]));
+    }
+
+    @Test
+    public void testParseVerifiesDilithiumSignatureInMultiLeafTree() throws Exception {
+        //A signature over one leaf of a two-leaf tree verifies once the control block proves that leaf to the UTXO's root
+        byte[] seed = testSeed(0x30);
+        byte[] pubKey = Mldsa44.publicKeyFromSeed(seed);
+        byte[] leafA = P2MR.singleKeyLeafScript(pubKey);
+        byte[] hashB = P2MR.tapLeafHash(P2MR.singleKeyLeafScript(Mldsa44.publicKeyFromSeed(testSeed(0x50))));
+        byte[] root = P2MR.tapBranchHash(P2MR.tapLeafHash(leafA), hashB);
+        byte[] controlA = new byte[33];
+        controlA[0] = (byte)P2MR.CONTROL_BYTE;
+        System.arraycopy(hashB, 0, controlA, 1, 32);
+
+        PSBT psbt = buildFixedPsbt(pubKey);
+        PSBTInput input = psbt.getPsbtInputs().get(0);
+        Script treeScript = new Script(P2MR.outputScript(root));
+        input.setWitnessUtxo(new TransactionOutput(psbt.getTransaction(), 100_000L, treeScript));
+        input.setP2mrLeaf(leafA, (byte)P2MR.LEAF_VERSION, controlA);
+        input.setP2mrMerkleRoot(root);
+        BtqPsbtSigner.sign(psbt, Map.of(0, seed));
+
+        PSBT parsed = new PSBT(psbt.serialize(), true);
+        Assertions.assertTrue(parsed.getPsbtInputs().get(0).isSigned());
+    }
 }

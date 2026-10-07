@@ -26,8 +26,13 @@ import static com.sparrowwallet.drongo.protocol.ScriptOpCodes.OP_PUSHDATA2;
 public final class P2MR {
     public static final int LEAF_VERSION = 0xc0;
     public static final int CONTROL_BYTE = 0xc1;
+    /** Each Merkle path node in a P2MR control block, after its single control byte. */
+    public static final int CONTROL_NODE_BYTES = 32;
+    /** The deepest script tree a P2MR control block may prove membership in (BTQ Core's P2MR_CONTROL_MAX_NODE_COUNT). */
+    public static final int CONTROL_MAX_NODE_COUNT = 128;
 
     private static final byte[] TAP_LEAF_TAG = sha256("TapLeaf".getBytes(java.nio.charset.StandardCharsets.US_ASCII));
+    private static final byte[] TAP_BRANCH_TAG = sha256("TapBranch".getBytes(java.nio.charset.StandardCharsets.US_ASCII));
 
     private P2MR() {
     }
@@ -90,6 +95,41 @@ public final class P2MR {
     /** The single-byte control block ({@value #CONTROL_BYTE}) for the one-leaf tree. */
     public static byte[] singleLeafControlBlock() {
         return new byte[]{(byte)CONTROL_BYTE};
+    }
+
+    /**
+     * The Merkle root a control block proves the given {@value #LEAF_VERSION} leaf to be part of, folding each path node in
+     * with BIP341's sorted TapBranch hash as BTQ Core's {@code ComputeP2MRMerkleRoot} does. For a P2MR output this root is
+     * the witness program itself, since P2MR has no internal key to tweak.
+     *
+     * @return the 32-byte root, or null if the control block is malformed or is not for a {@value #LEAF_VERSION} leaf with
+     *         the parity bit BIP360 requires
+     */
+    public static byte[] merkleRootFromControlBlock(byte[] leafScript, byte[] controlBlock) {
+        if(leafScript == null || controlBlock == null || controlBlock.length < 1
+                || controlBlock.length > 1 + CONTROL_NODE_BYTES * CONTROL_MAX_NODE_COUNT || (controlBlock.length - 1) % CONTROL_NODE_BYTES != 0) {
+            return null;
+        }
+        if((controlBlock[0] & 0xff) != CONTROL_BYTE) {
+            return null;
+        }
+
+        byte[] node = tapLeafHash(leafScript);
+        for(int offset = 1; offset < controlBlock.length; offset += CONTROL_NODE_BYTES) {
+            node = tapBranchHash(node, Arrays.copyOfRange(controlBlock, offset, offset + CONTROL_NODE_BYTES));
+        }
+        return node;
+    }
+
+    /** The BIP341 TapBranch hash {@code tagged_hash("TapBranch", min(a, b) || max(a, b))}. */
+    public static byte[] tapBranchHash(byte[] a, byte[] b) {
+        boolean ordered = Arrays.compareUnsigned(a, b) <= 0;
+        MessageDigest digest = sha256Digest();
+        digest.update(TAP_BRANCH_TAG);
+        digest.update(TAP_BRANCH_TAG);
+        digest.update(ordered ? a : b);
+        digest.update(ordered ? b : a);
+        return digest.digest();
     }
 
     public static P2MRAddress addressFromMerkleRoot(byte[] merkleRoot) {
