@@ -117,7 +117,11 @@ public class PSBTOutput {
                     if(entry.getData().length != 8) {
                         throw new PSBTParseException("PSBT output amount must be 8 bytes");
                     }
-                    this.amount = Utils.readInt64(entry.getData(), 0);
+                    long outputAmount = Utils.readInt64(entry.getData(), 0);
+                    if(outputAmount < 0 || outputAmount > Transaction.MAX_SATOSHIS) {
+                        throw new PSBTParseException("PSBT output amount is out of range: " + outputAmount);
+                    }
+                    this.amount = outputAmount;
                     log.debug("Found output amount " + this.amount);
                     break;
                 case PSBT_OUT_SCRIPT:
@@ -127,6 +131,7 @@ public class PSBTOutput {
                     log.debug("Found output script hex " + Utils.bytesToHex(script.getProgram()) + " script " + script);
                     break;
                 case PSBT_OUT_PROPRIETARY:
+                    entry.checkOneBytePlusKeyData();
                     proprietary.put(Utils.bytesToHex(entry.getKeyData()), Utils.bytesToHex(entry.getData()));
                     log.debug("Found proprietary output " + Utils.bytesToHex(entry.getKeyData()) + ": " + Utils.bytesToHex(entry.getData()));
                     break;

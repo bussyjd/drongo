@@ -14,6 +14,7 @@ import org.slf4j.LoggerFactory;
 import java.io.*;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
+import java.security.SecureRandom;
 import java.util.*;
 import java.util.stream.Collectors;
 
@@ -45,8 +46,8 @@ public class PSBT {
     public static final int STATE_OUTPUTS = 3;
     public static final int STATE_END = 4;
 
-    private int inputs = 0;
-    private int outputs = 0;
+    private long inputs = 0;
+    private long outputs = 0;
 
     private byte[] psbtBytes;
 
@@ -122,7 +123,7 @@ public class PSBT {
         }
 
         //Shuffle outputs so change outputs are less obvious
-        Random random = new Random();
+        SecureRandom random = new SecureRandom();
         for(int i = transaction.getOutputs().size() - 1; i > 0; i--) {
             int j = random.nextInt(i + 1);
             transaction.swapOutputs(i, j);
@@ -167,9 +168,7 @@ public class PSBT {
             Map<ECKey, KeyDerivation> spSpendDerivations = new LinkedHashMap<>();
             for(Keystore keystore : signingWallet.getKeystores()) {
                 if(silentPaymentsTweak != null && keystore.getSilentPaymentScanAddress() != null && signingWallet.getPolicyType() == PolicyType.SINGLE_SP) {
-                    ECKey spendPubKey = keystore.getSilentPaymentScanAddress().getSpendKey();
-                    KeyDerivation spendKeyDerivation = new KeyDerivation(keystore.getKeyDerivation().getMasterFingerprint(), KeyDerivation.writePath(KeyDerivation.getBip352SpendDerivation(keystore.getKeyDerivation().getDerivation())));
-                    spSpendDerivations.put(spendPubKey, spendKeyDerivation);
+                    putSilentPaymentsSpendDerivation(keystore, spSpendDerivations);
                 } else if(signingWallet.getPolicyType() != PolicyType.SINGLE_MLDSA) {
                     derivedPublicKeys.put(signingWallet.getScriptType().getOutputKey(signingWallet.getPolicyType(), keystore.getPubKey(walletNode)), keystore.getKeyDerivation().extend(walletNode.getDerivation()));
                     if(signingWallet.getScriptType() == ScriptType.P2TR) {
@@ -246,7 +245,11 @@ public class PSBT {
 
     public PSBT(byte[] psbt, boolean verifySignatures) throws PSBTParseException {
         this.psbtBytes = psbt;
-        parse(verifySignatures);
+        try {
+            parse(verifySignatures);
+        } catch(RuntimeException e) {
+            throw new PSBTParseException("Invalid data in PSBT" + (e.getMessage() == null ? "" : ": " + e.getMessage()), e);
+        }
     }
 
     private void parse(boolean verifySignatures) throws PSBTParseException {
@@ -255,14 +258,18 @@ public class PSBT {
 
         ByteBuffer psbtByteBuffer = ByteBuffer.wrap(psbtBytes);
 
+        if(psbtByteBuffer.remaining() < 5) {
+            throw new PSBTParseException("PSBT is truncated - only " + psbtByteBuffer.remaining() + " bytes are present, too short for the magic value and separator");
+        }
+
         byte[] magicBuf = new byte[4];
         psbtByteBuffer.get(magicBuf);
-        if (!PSBT_MAGIC_HEX.equalsIgnoreCase(Utils.bytesToHex(magicBuf))) {
+        if(!PSBT_MAGIC_HEX.equalsIgnoreCase(Utils.bytesToHex(magicBuf))) {
             throw new PSBTParseException("PSBT has invalid magic value");
         }
 
         byte sep = psbtByteBuffer.get();
-        if (sep != (byte) 0xff) {
+        if(sep != (byte)0xff) {
             throw new PSBTParseException("PSBT has bad initial separator: " + Utils.bytesToHex(new byte[]{sep}));
         }
 
@@ -274,11 +281,11 @@ public class PSBT {
         List<PSBTEntry> inputEntries = new ArrayList<>();
         List<PSBTEntry> outputEntries = new ArrayList<>();
 
-        while (psbtByteBuffer.hasRemaining()) {
+        while(psbtByteBuffer.hasRemaining()) {
             PSBTEntry entry = new PSBTEntry(psbtByteBuffer);
 
             if(entry.getKey() == null) {         // length == 0
-                switch (currentState) {
+                switch(currentState) {
                     case STATE_GLOBALS:
                         currentState = STATE_INPUTS;
                         parseGlobalEntries(globalEntries);
@@ -288,7 +295,7 @@ public class PSBT {
                         inputEntries = new ArrayList<>();
 
                         seenInputs++;
-                        if (seenInputs == inputs) {
+                        if(seenInputs == inputs) {
                             currentState = STATE_OUTPUTS;
                             parseInputEntries(inputEntryLists);
                         }
@@ -298,7 +305,7 @@ public class PSBT {
                         outputEntries = new ArrayList<>();
 
                         seenOutputs++;
-                        if (seenOutputs == outputs) {
+                        if(seenOutputs == outputs) {
                             currentState = STATE_END;
                             parseOutputEntries(outputEntryLists);
                         }
@@ -308,21 +315,23 @@ public class PSBT {
                     default:
                         throw new PSBTParseException("PSBT structure invalid");
                 }
-            } else if (currentState == STATE_GLOBALS) {
+            } else if(currentState == STATE_GLOBALS) {
                 globalEntries.add(entry);
-            } else if (currentState == STATE_INPUTS) {
+            } else if(currentState == STATE_INPUTS) {
                 inputEntries.add(entry);
-            } else if (currentState == STATE_OUTPUTS) {
+            } else if(currentState == STATE_OUTPUTS) {
                 outputEntries.add(entry);
             } else {
                 throw new PSBTParseException("PSBT structure invalid");
             }
         }
 
+        if(currentState == STATE_GLOBALS) {
+            throw new PSBTParseException("PSBT is truncated, the global map is not terminated");
+        }
+
         if(currentState != STATE_END) {
-            if(getPsbtVersion() == 0 && transaction == null) {
-                throw new PSBTParseException("Missing transaction");
-            }
+            throw new PSBTParseException("PSBT is truncated - " + inputs + " inputs and " + outputs + " outputs are expected, but only " + seenInputs + " input maps and " + seenOutputs + " output maps are present");
         }
 
         if(verifySignatures) {
@@ -349,13 +358,13 @@ public class PSBT {
                     inputs = transaction.getInputs().size();
                     outputs = transaction.getOutputs().size();
                     log.debug("Transaction with txid: " + transaction.getTxId() + " version " + transaction.getVersion() + " size " + transaction.getMessageSize() + " locktime " + transaction.getLocktime());
-                    for(TransactionInput input: transaction.getInputs()) {
+                    for(TransactionInput input : transaction.getInputs()) {
                         if(input.getScriptSig().getProgram().length != 0) {
                             throw new PSBTParseException("Unsigned tx input does not have empty scriptSig");
                         }
                         log.debug(" Transaction input references txid: " + input.getOutpoint().getHash() + " vout " + input.getOutpoint().getIndex() + " with script " + input.getScriptSig());
                     }
-                    for(TransactionOutput output: transaction.getOutputs()) {
+                    for(TransactionOutput output : transaction.getOutputs()) {
                         try {
                             log.debug(" Transaction output value: " + output.getValue() + " to addresses " + Arrays.asList(output.getScript().getToAddresses()) + " with script hex " + Utils.bytesToHex(output.getScript().getProgram()) + " to script " + output.getScript());
                         } catch(NonStandardScriptException e) {
@@ -391,16 +400,14 @@ public class PSBT {
                     break;
                 case PSBT_GLOBAL_INPUT_COUNT:
                     entry.checkOneByteKey();
-                    VarInt varIntInputCount = new VarInt(entry.getData(), 0);
-                    this.inputCount = varIntInputCount.value;
-                    this.inputs = inputCount.intValue();
+                    this.inputCount = readCount(entry, "input");
+                    this.inputs = inputCount;
                     log.debug("PSBT input count: " + inputCount);
                     break;
                 case PSBT_GLOBAL_OUTPUT_COUNT:
                     entry.checkOneByteKey();
-                    VarInt varIntOutputCount = new VarInt(entry.getData(), 0);
-                    this.outputCount = varIntOutputCount.value;
-                    this.outputs = outputCount.intValue();
+                    this.outputCount = readCount(entry, "output");
+                    this.outputs = outputCount;
                     log.debug("PSBT output count: " + outputCount);
                     break;
                 case PSBT_GLOBAL_TX_MODIFIABLE:
@@ -416,8 +423,11 @@ public class PSBT {
                     if(entry.getData().length != 4) {
                         throw new PSBTParseException("PSBT global version must be 4 bytes");
                     }
-                    int version = (int)Utils.readUint32(entry.getData(), 0);
-                    this.version = version;
+                    long version = Utils.readUint32(entry.getData(), 0);
+                    if(version > 2) {
+                        throw new PSBTParseException("PSBT version " + version + " is not supported");
+                    }
+                    this.version = (int)version;
                     log.debug("PSBT version: " + version);
                     break;
                 case PSBT_GLOBAL_SP_ECDH_SHARE:
@@ -446,6 +456,7 @@ public class PSBT {
                     log.debug("PSBT global generic signed message: " + genericSignedMessage);
                     break;
                 case PSBT_GLOBAL_PROPRIETARY:
+                    entry.checkOneBytePlusKeyData();
                     globalProprietary.put(Utils.bytesToHex(entry.getKeyData()), Utils.bytesToHex(entry.getData()));
                     log.debug("PSBT global proprietary data: " + Utils.bytesToHex(entry.getData()));
                     break;
@@ -588,10 +599,22 @@ public class PSBT {
         return version == null ? 0 : version;
     }
 
+    private long readCount(PSBTEntry entry, String type) throws PSBTParseException {
+        //Pad the data so a short or absent encoding cannot read beyond it. The length is not required to match the encoding,
+        //since some implementations write a four byte value here rather than the compact size uint BIP370 specifies. The two forms
+        //coincide below 253 only - above that this reads the leading byte of the four byte form, and the map count check rejects it.
+        VarInt varIntCount = new VarInt(Arrays.copyOf(entry.getData(), 9), 0);
+        if(varIntCount.value < 1) {
+            throw new PSBTParseException("PSBT " + type + " count must be at least one");
+        }
+
+        return varIntCount.value;
+    }
+
     private PSBTEntry findDuplicateKey(List<PSBTEntry> entries) {
         Set<String> checkSet = new HashSet<>();
-        for(PSBTEntry entry: entries) {
-            if(!checkSet.add(Utils.bytesToHex(entry.getKey())) ) {
+        for(PSBTEntry entry : entries) {
+            if(!checkSet.add(Utils.bytesToHex(entry.getKey()))) {
                 return entry;
             }
         }
@@ -602,22 +625,33 @@ public class PSBT {
     public Long getFee() {
         long fee = 0L;
 
-        for(PSBTInput input : psbtInputs) {
-            TransactionOutput utxo = input.getUtxo();
+        try {
+            for(PSBTInput input : psbtInputs) {
+                TransactionOutput utxo = input.getUtxo();
 
-            if(utxo != null) {
-                fee += utxo.getValue();
-            } else {
-                log.warn("Cannot determine fee - inputs are missing UTXO data");
-                return null;
+                if(utxo != null) {
+                    fee = Math.addExact(fee, utxo.getValue());
+                } else {
+                    log.warn("Cannot determine fee - inputs are missing UTXO data");
+                    return null;
+                }
             }
-        }
 
-        for(PSBTOutput output : psbtOutputs) {
-            fee -= output.getAmount();
+            for(PSBTOutput output : psbtOutputs) {
+                fee = Math.subtractExact(fee, output.getAmount());
+            }
+        } catch(ArithmeticException e) {
+            log.warn("Cannot determine fee - the sum of the input or output amounts is out of range");
+            return null;
         }
 
         return fee;
+    }
+
+    private static void putSilentPaymentsSpendDerivation(Keystore keystore, Map<ECKey, KeyDerivation> spendDerivations) {
+        ECKey spendPubKey = keystore.getSilentPaymentScanAddress().getSpendKey();
+        KeyDerivation spendKeyDerivation = new KeyDerivation(keystore.getKeyDerivation().getMasterFingerprint(), KeyDerivation.writePath(KeyDerivation.getBip352SpendDerivation(keystore.getKeyDerivation().getDerivation())));
+        spendDerivations.put(spendPubKey, spendKeyDerivation);
     }
 
     public void addKeyPathInformation(Wallet signingWallet) {
@@ -641,11 +675,11 @@ public class PSBT {
             for(PSBTInput psbtInput : missingKeyPathInputs) {
                 WalletNode walletNode = signingNodes.get(psbtInput);
                 if(walletNode != null && walletNode.getWallet() != null) {
+                    byte[] silentPaymentsTweak = walletNode.getSilentPaymentTweak() != null ? walletNode.getSilentPaymentTweak() : psbtInput.getSilentPaymentsTweak();
                     for(Keystore keystore : signingWallet.getKeystores()) {
-                        if(psbtInput.getSilentPaymentsTweak() != null && keystore.getSilentPaymentScanAddress() != null && signingWallet.getPolicyType() == PolicyType.SINGLE_SP) {
-                            ECKey spendPubKey = keystore.getSilentPaymentScanAddress().getSpendKey();
-                            KeyDerivation spendKeyDerivation = new KeyDerivation(keystore.getKeyDerivation().getMasterFingerprint(), KeyDerivation.writePath(KeyDerivation.getBip352SpendDerivation(keystore.getKeyDerivation().getDerivation())));
-                            psbtInput.getSilentPaymentsSpendDerivations().put(spendPubKey, spendKeyDerivation);
+                        if(silentPaymentsTweak != null && keystore.getSilentPaymentScanAddress() != null && signingWallet.getPolicyType() == PolicyType.SINGLE_SP) {
+                            psbtInput.setSilentPaymentsTweak(silentPaymentsTweak);
+                            putSilentPaymentsSpendDerivation(keystore, psbtInput.getSilentPaymentsSpendDerivations());
                         } else {
                             ScriptType scriptType = walletNode.getWallet().getScriptType();
                             ECKey pubKey = keystore.getPubKey(walletNode);
@@ -722,7 +756,7 @@ public class PSBT {
 
     /**
      * Validates silent payment ECDH shares and DLEQ proofs according to BIP-375.
-     *
+     * <p>
      * For each silent payment output, validates that:
      * 1. Either global or per-input ECDH shares and DLEQ proofs are provided for Taproot inputs
      * 2. The DLEQ proofs are cryptographically valid
@@ -745,8 +779,8 @@ public class PSBT {
             }
         }
 
-        Set<HashIndex> outpoints = inputPublicKeys.keySet().stream()
-                .map(input -> new HashIndex(input.getOutpoint().getHash(), input.getOutpoint().getIndex()))
+        Set<HashIndex> outpoints = getPsbtInputs().stream()
+                .map(psbtInput -> new HashIndex(psbtInput.getPrevTxid(), psbtInput.getPrevIndex()))
                 .collect(Collectors.toCollection(LinkedHashSet::new));
         ECKey summedPublicKey = SilentPaymentUtils.getSummedPublicKey(inputPublicKeys.values());
         if(summedPublicKey == null) {
@@ -909,7 +943,7 @@ public class PSBT {
                 entries.add(populateEntry(PSBT_GLOBAL_OUTPUT_COUNT, null, varIntOutputCount.encode()));
             }
             if(modifiable != null) {
-                entries.add(populateEntry(PSBT_GLOBAL_TX_MODIFIABLE, null, new byte[] { modifiable }));
+                entries.add(populateEntry(PSBT_GLOBAL_TX_MODIFIABLE, null, new byte[]{modifiable}));
             }
             for(Map.Entry<ECKey, ECKey> entry : silentPaymentsEcdhShares.entrySet()) {
                 entries.add(populateEntry(PSBT_GLOBAL_SP_ECDH_SHARE, entry.getKey().getPubKey(), entry.getValue().getPubKey()));
@@ -944,7 +978,7 @@ public class PSBT {
         ByteArrayOutputStream baos = new ByteArrayOutputStream();
 
         baos.writeBytes(Utils.hexToBytes(PSBT_MAGIC_HEX));
-        baos.writeBytes(new byte[] {(byte)0xff});
+        baos.writeBytes(new byte[]{(byte)0xff});
 
         List<PSBTEntry> globalEntries = getGlobalEntries();
         for(PSBTEntry entry : globalEntries) {
@@ -952,7 +986,7 @@ public class PSBT {
                 entry.serializeToStream(baos);
             }
         }
-        baos.writeBytes(new byte[] {(byte)0x00});
+        baos.writeBytes(new byte[]{(byte)0x00});
 
         for(PSBTInput psbtInput : getPsbtInputs()) {
             List<PSBTEntry> inputEntries = psbtInput.getInputEntries(getPsbtVersion());
@@ -964,7 +998,7 @@ public class PSBT {
                     entry.serializeToStream(baos);
                 }
             }
-            baos.writeBytes(new byte[] {(byte)0x00});
+            baos.writeBytes(new byte[]{(byte)0x00});
         }
 
         for(PSBTOutput psbtOutput : getPsbtOutputs()) {
@@ -976,17 +1010,84 @@ public class PSBT {
                     entry.serializeToStream(baos);
                 }
             }
-            baos.writeBytes(new byte[] {(byte)0x00});
+            baos.writeBytes(new byte[]{(byte)0x00});
         }
 
         return baos.toByteArray();
     }
 
-    public void verifyCombinedSignatures(PSBT psbt) throws PSBTSignatureException {
+    /**
+     * Verifies that combining the given PSBT with this one is safe, by checking the signatures it provides, that it does not introduce a more dangerous
+     * sighash type, that it does not change an output script this PSBT has already resolved, and that it does not change the utxo or the scripts that
+     * utxo commits to for any input.
+     *
+     * @param psbt the PSBT to be combined with this one
+     * @return the verified result of the combine, which can be inspected further before the combine is applied to this PSBT
+     * @throws PSBTSignatureException if the provided PSBT cannot be safely combined
+     */
+    public PSBT verifyCombinedSignatures(PSBT psbt) throws PSBTSignatureException {
+        verifyCombinedOutputScripts(psbt);
+        verifyCombinedInputScripts(psbt);
         PSBT verificationCopy = this.copy();
         verificationCopy.combine(psbt);
+        verifyCombinedUtxos(verificationCopy);
         verificationCopy.verifySignatures();
         verifyCombinedSigHashes(verificationCopy);
+
+        return verificationCopy;
+    }
+
+    private void verifyCombinedOutputScripts(PSBT psbt) throws PSBTSignatureException {
+        for(int i = 0; i < getPsbtOutputs().size() && i < psbt.getPsbtOutputs().size(); i++) {
+            Script script = getPsbtOutputs().get(i).getScript();
+            Script combinedScript = psbt.getPsbtOutputs().get(i).getScript();
+            //A silent payment output is identified by its address rather than its resolved script, so a combine must not change a script already resolved
+            if(script != null && !script.isEmpty() && combinedScript != null && !script.equals(combinedScript)) {
+                throw new PSBTSignatureException("Combined PSBT would change the script of the output at index " + i);
+            }
+        }
+    }
+
+    private void verifyCombinedInputScripts(PSBT psbt) throws PSBTSignatureException {
+        for(int i = 0; i < getPsbtInputs().size() && i < psbt.getPsbtInputs().size(); i++) {
+            PSBTInput psbtInput = getPsbtInputs().get(i);
+            PSBTInput combinedInput = psbt.getPsbtInputs().get(i);
+
+            //Only the non witness utxo is verified against the outpoint txid, so the amount and script a witness input is already spending must not be restated by a combine
+            TransactionOutput witnessUtxo = psbtInput.getWitnessUtxo();
+            TransactionOutput combinedWitnessUtxo = combinedInput.getWitnessUtxo();
+            if(witnessUtxo != null && combinedWitnessUtxo != null) {
+                if(witnessUtxo.getValue() != combinedWitnessUtxo.getValue()) {
+                    throw new PSBTSignatureException("Combined PSBT would change the amount of input " + i + " from " + witnessUtxo.getValue() + " sats to " + combinedWitnessUtxo.getValue() + " sats");
+                }
+                if(!witnessUtxo.getScript().equals(combinedWitnessUtxo.getScript())) {
+                    throw new PSBTSignatureException("Combined PSBT would change the utxo script of input " + i);
+                }
+            }
+
+            //The utxo commits to the hash of these scripts, so a combine that replaced one would have every signature still to be collected made over a script that cannot spend it
+            if(isReplacement(psbtInput.getRedeemScript(), combinedInput.getRedeemScript())) {
+                throw new PSBTSignatureException("Combined PSBT would change the redeem script of input " + i);
+            }
+            if(isReplacement(psbtInput.getWitnessScript(), combinedInput.getWitnessScript())) {
+                throw new PSBTSignatureException("Combined PSBT would change the witness script of input " + i);
+            }
+        }
+    }
+
+    private boolean isReplacement(Script script, Script combinedScript) {
+        return script != null && combinedScript != null && !script.equals(combinedScript);
+    }
+
+    private void verifyCombinedUtxos(PSBT verificationCopy) throws PSBTSignatureException {
+        for(PSBTInput verificationInput : verificationCopy.getPsbtInputs()) {
+            //A script this PSBT did not already provide arrives unverified, since verifyUtxo() is only applied to the entries a PSBT is parsed from
+            try {
+                verificationInput.verifyUtxo();
+            } catch(PSBTParseException e) {
+                throw new PSBTSignatureException("Combined PSBT would provide an inconsistent utxo: " + e.getMessage());
+            }
+        }
     }
 
     private void verifyCombinedSigHashes(PSBT verificationCopy) throws PSBTSignatureException {
@@ -998,6 +1099,43 @@ public class PSBT {
                     otherInput.verifySigHash();
                 } catch(PSBTSignatureException e) {
                     throw new PSBTSignatureException("Combined PSBT would change sighash: " + e.getMessage());
+                }
+            }
+        }
+    }
+
+    /**
+     * Verifies that copying the finalized fields of the given PSBT into this one is safe, by checking that the signatures they contain verify against
+     * the transaction this PSBT represents, using the signing scripts and keys it already provides.
+     *
+     * @param finalizedPsbt the finalized PSBT providing the fields to be copied
+     * @throws PSBTSignatureException if the finalized fields cannot be safely copied
+     */
+    public void verifyFinalizedSignatures(PSBT finalizedPsbt) throws PSBTSignatureException {
+        if(!matches(finalizedPsbt)) {
+            throw new PSBTSignatureException("Provided PSBT does not represent a matching transaction");
+        }
+
+        PSBT verificationCopy = this.copy();
+        for(int i = 0; i < verificationCopy.getPsbtInputs().size(); i++) {
+            PSBTInput verificationInput = verificationCopy.getPsbtInputs().get(i);
+            PSBTInput finalizedInput = finalizedPsbt.getPsbtInputs().get(i);
+            //The non final fields are retained here, so the finalized signatures are verified against the signing scripts and keys already provided
+            verificationInput.setFinalScriptSig(finalizedInput.getFinalScriptSig());
+            verificationInput.setFinalScriptWitness(finalizedInput.getFinalScriptWitness());
+            verifyFinalizedSigHashes(verificationInput, verificationInput.verifyFinalizedSignatures());
+        }
+    }
+
+    private void verifyFinalizedSigHashes(PSBTInput verificationInput, Collection<TransactionSignature> signatures) throws PSBTSignatureException {
+        for(TransactionSignature signature : signatures) {
+            //Finalizing clears PSBT_IN_SIGHASH_TYPE, so the type a finalized signature commits to can only be read from the signature itself
+            SigHash sigHash = signature.getSigHash();
+            if(sigHashSeverity(sigHash) > sigHashSeverity(verificationInput.getSigHash())) {
+                try {
+                    verificationInput.verifySigHash(sigHash);
+                } catch(PSBTSignatureException e) {
+                    throw new PSBTSignatureException("Finalized PSBT would change sighash: " + e.getMessage());
                 }
             }
         }
@@ -1102,17 +1240,26 @@ public class PSBT {
         PSBT publicCopy = this.copy();
         publicCopy.extendedPublicKeys.clear();
         publicCopy.globalProprietary.clear();
+        publicCopy.silentPaymentsEcdhShares.clear();
+        publicCopy.silentPaymentsDLEQProofs.clear();
         for(PSBTInput psbtInput : publicCopy.getPsbtInputs()) {
             psbtInput.getDerivedPublicKeys().clear();
             psbtInput.getTapDerivedPublicKeys().clear();
             psbtInput.setTapInternalKey(null);
             psbtInput.getProprietary().clear();
+            psbtInput.getSilentPaymentsSpendDerivations().clear();
+            psbtInput.setSilentPaymentsTweak(null);
+            psbtInput.getSilentPaymentsEcdhShares().clear();
+            psbtInput.getSilentPaymentsDLEQProofs().clear();
         }
         for(PSBTOutput psbtOutput : publicCopy.getPsbtOutputs()) {
             psbtOutput.getDerivedPublicKeys().clear();
             psbtOutput.getTapDerivedPublicKeys().clear();
             psbtOutput.setTapInternalKey(null);
             psbtOutput.getProprietary().clear();
+            psbtOutput.setSilentPaymentAddress(null);
+            psbtOutput.setSilentPaymentLabel(null);
+            psbtOutput.setDnssecProof(null);
         }
 
         return publicCopy;
@@ -1449,7 +1596,7 @@ public class PSBT {
             ByteBuffer buffer = ByteBuffer.wrap(b);
             int header = buffer.getInt();
             return header == PSBT_MAGIC_INT;
-        } catch (Exception e) {
+        } catch(Exception e) {
             //ignore
         }
 
@@ -1475,11 +1622,11 @@ public class PSBT {
     }
 
     public static PSBT fromString(String strPSBT, boolean verifySignatures) throws PSBTParseException {
-        if (!isPSBT(strPSBT)) {
+        if(!isPSBT(strPSBT)) {
             throw new PSBTParseException("Provided string is not a PSBT");
         }
 
-        if (Utils.isBase64(strPSBT) && !Utils.isHex(strPSBT)) {
+        if(Utils.isBase64(strPSBT) && !Utils.isHex(strPSBT)) {
             strPSBT = Utils.bytesToHex(Base64.getDecoder().decode(strPSBT));
         }
 

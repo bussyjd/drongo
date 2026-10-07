@@ -137,8 +137,33 @@ public class OutputDescriptorTest {
     @Test
     public void testMultisigThresholdNeverDefaulted() {
         //A descriptor providing multiple keys but no recognisable threshold must be rejected, not silently downgraded to 1 of n
-        Assertions.assertThrows(IllegalArgumentException.class, () -> OutputDescriptor.getOutputDescriptor(
-                "tr(multi_a(2," + MULTI_KEY_1 + "," + MULTI_KEY_2 + "," + MULTI_KEY_3 + "))"));
+        IllegalArgumentException e = Assertions.assertThrows(IllegalArgumentException.class, () -> OutputDescriptor.getOutputDescriptor(
+                "wsh(or_d(pk(" + MULTI_KEY_1 + "),pk(" + MULTI_KEY_2 + ")))"));
+        Assertions.assertTrue(e.getMessage().contains("multisig threshold"), e.getMessage());
+    }
+
+    @Test
+    public void testTaprootScriptPathRejected() {
+        //A script tree must be rejected, not silently dropped to leave a key path only wallet
+        IllegalArgumentException e = Assertions.assertThrows(IllegalArgumentException.class, () -> OutputDescriptor.getOutputDescriptor(
+                "tr([73c5da0a/86h/0h/0h]xpub6BgBgsespWvERF3LHQu6CnqdvfEvtMcQjYrcRzx53QJjSxarj2afYWcLteoGVky7D3UKDP9QyrLprQ3VCECoY49yfdDEHGCtMMj92pReUsQ/<0;1>/*,pk(68df03fc2c883065ee88fba337b713f30c1bc5366c586a58201a47d1540c3e8a))#q6ck4urp"));
+        Assertions.assertTrue(e.getMessage().contains("script path"), e.getMessage());
+
+        OutputDescriptor keyPath = OutputDescriptor.getOutputDescriptor("tr([73c5da0a/86h/0h/0h]xpub6BgBgsespWvERF3LHQu6CnqdvfEvtMcQjYrcRzx53QJjSxarj2afYWcLteoGVky7D3UKDP9QyrLprQ3VCECoY49yfdDEHGCtMMj92pReUsQ/<0;1>/*)");
+        Assertions.assertEquals(ScriptType.P2TR, keyPath.getScriptType());
+        Assertions.assertEquals(PolicyType.SINGLE_HD, keyPath.toWallet().getPolicyType());
+    }
+
+    @Test
+    public void testKeylessDescriptorRejected() {
+        IllegalArgumentException e = Assertions.assertThrows(IllegalArgumentException.class, () -> OutputDescriptor.getOutputDescriptor("addr(bc1qfrqwk9ltzet5ssul4yq7uave43ngykmf9ds3gk)#zr7ru4eh"));
+        Assertions.assertTrue(e.getMessage().contains("Address descriptors"), e.getMessage());
+
+        e = Assertions.assertThrows(IllegalArgumentException.class, () -> OutputDescriptor.getOutputDescriptor("wpkh()"));
+        Assertions.assertTrue(e.getMessage().contains("No extended public keys"), e.getMessage());
+
+        OutputDescriptor singleKey = OutputDescriptor.getOutputDescriptor("wpkh([73c5da0a/84h/0h/0h]xpub6CatWdiZiodmUeTDp8LT5or8nmbKNcuyvz7WyksVFkKB4RHwCD3XyuvPEbvqAQY3rAPshWcMLoP2fMFMKHPJ4ZeZXYVUhLv1VMrjPC7PW6V/<0;1>/*)");
+        Assertions.assertEquals(PolicyType.SINGLE_HD, singleKey.toWallet().getPolicyType());
     }
 
     @Test

@@ -328,7 +328,7 @@ public class OutputDescriptor {
         wallet.setPolicyType(isMultisig() || isCosigner() ? PolicyType.MULTI_HD : PolicyType.SINGLE_HD);
         wallet.setScriptType(scriptType);
 
-        for(Map.Entry<ExtendedKey,KeyDerivation> extKeyEntry : extendedPublicKeys.entrySet()) {
+        for(Map.Entry<ExtendedKey, KeyDerivation> extKeyEntry : extendedPublicKeys.entrySet()) {
             ExtendedKey xpub = extKeyEntry.getKey();
             Keystore keystore = new Keystore();
             if(extendedMasterPrivateKeys.containsKey(xpub)) {
@@ -526,11 +526,15 @@ public class OutputDescriptor {
             descriptor = descriptor.substring(0, annotationStart);
         }
 
-        if(descriptor.toLowerCase(Locale.ROOT).startsWith("sp(")) {
+        if(isSilentPaymentDescriptor(descriptor)) {
             return parseSilentPaymentDescriptor(descriptor, annotations);
         }
 
         ScriptType scriptType = ScriptType.fromDescriptor(descriptor);
+        if(scriptType == ScriptType.P2TR && descriptor.substring(scriptType.getDescriptor().length()).matches("(?s).*[,(].*")) {
+            //Only key path taproot wallets are supported, and a key expression cannot contain a comma or parenthesis, so anything else is a script tree or expression
+            throw new IllegalArgumentException("Taproot descriptors with script path spends are not supported");
+        }
         if(scriptType == null) {
             ExtendedKey.Header header = ExtendedKey.Header.fromExtendedKey(descriptor);
             scriptType = header.getDefaultScriptType();
@@ -613,6 +617,10 @@ public class OutputDescriptor {
             Matcher pubKeyMatcher = PUBKEY_PATTERN.matcher(descriptor);
             if(pubKeyMatcher.find()) {
                 throw new IllegalArgumentException("Descriptors with single public keys are not supported - use descriptors with xpubs");
+            } else if(scriptType == ScriptType.P2A) {
+                throw new IllegalArgumentException("Address descriptors are not supported - use descriptors with xpubs");
+            } else {
+                throw new IllegalArgumentException("No extended public keys found in descriptor");
             }
         }
 
@@ -627,8 +635,12 @@ public class OutputDescriptor {
         return new OutputDescriptor(scriptType, Math.max(multisigThreshold, 1), keyDerivationMap, keyChildDerivationMap, mapExtendedPublicKeyLabels, masterPrivateKeyMap, annotations);
     }
 
+    public static boolean isSilentPaymentDescriptor(String descriptor) {
+        return descriptor.toLowerCase(Locale.ROOT).startsWith("sp(");
+    }
+
     private static OutputDescriptor parseSilentPaymentDescriptor(String descriptor, Map<String, Integer> annotations) {
-        if(!descriptor.startsWith("sp(") || !descriptor.endsWith(")")) {
+        if(!isSilentPaymentDescriptor(descriptor) || !descriptor.endsWith(")")) {
             throw new IllegalArgumentException("Invalid sp() descriptor format");
         }
         String inner = descriptor.substring(3, descriptor.length() - 1);
@@ -641,7 +653,8 @@ public class OutputDescriptor {
         }
     }
 
-    private record KeyDerivationAndKey(KeyDerivation keyDerivation, String key) {}
+    private record KeyDerivationAndKey(KeyDerivation keyDerivation, String key) {
+    }
 
     private static KeyDerivationAndKey parseKeyOrigin(String arg) {
         KeyDerivation keyDerivation = new KeyDerivation(null, (String)null);
@@ -840,8 +853,7 @@ public class OutputDescriptor {
         return ret.toString();
     }
 
-    private static BigInteger polyMod(BigInteger c, int val)
-    {
+    private static BigInteger polyMod(BigInteger c, int val) {
         byte c0 = c.shiftRight(35).byteValue();
         c = c.and(new BigInteger("7ffffffff", 16)).shiftLeft(5).xor(BigInteger.valueOf(val));
 

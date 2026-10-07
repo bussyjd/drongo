@@ -623,6 +623,35 @@ public class SilentPaymentUtilsTest {
         Assertions.assertEquals("2e847bb01d1b491da512ddd760b8509617ee38057003d6115d00ba562451323a", Utils.bytesToHex(silentPayments.getLast().getAddress().getData()));
     }
 
+    @Test
+    public void testBip375ThreeOutputsSameScanKey() throws InvalidSilentPaymentException {
+        // BIP375 sorts codes sharing a scan key lexicographically ascending to determine the k ordering, and orders
+        // codes sharing both scan and spend keys by ascending output index.
+        // Vector "can finalize: three sp outputs (same scan key) - output 0 uses label=1, outputs 1 and 2 uses label=2
+        // (same spend key)" from the proposed BIP375 v1.1.1 test vectors, https://github.com/bitcoin/bips/pull/2207
+        // Ascending code order places the two 032193ad... outputs ahead of 03d43158..., so outputs 1 and 2 take
+        // k=0 and k=1 in output index order and output 0 takes k=2, inverting the output ordering entirely.
+        ECKey scanKey = ECKey.fromPublicOnly(Utils.hexToBytes("028b790e0987fde9f0d12398eb6be30c7376793c647865a2a02f2efc960d966568"));
+        ECKey spendKeyLabel1 = ECKey.fromPublicOnly(Utils.hexToBytes("03d431588dee61ab3a39725b299c3742dc66a0861decf591b423b0e527070f8234"));
+        ECKey spendKeyLabel2 = ECKey.fromPublicOnly(Utils.hexToBytes("032193ad0c875fac5243738022900a7724c6175ddac9944165aab457aadf9c4f3c"));
+
+        List<SilentPayment> silentPayments = List.of(new SilentPayment(new SilentPaymentAddress(scanKey, spendKeyLabel1), "Output 0", 0, false),
+                new SilentPayment(new SilentPaymentAddress(scanKey, spendKeyLabel2), "Output 1", 0, false),
+                new SilentPayment(new SilentPaymentAddress(scanKey, spendKeyLabel2), "Output 2", 0, false));
+
+        ECKey summedPrivateKey = ECKey.fromPrivate(Utils.hexToBytes("7e31eeeb1aa2597b6d63b357541461d75ddae76b7603d24619f5ebed9e88ec31"));
+        Set<HashIndex> outpoints = Set.of(new HashIndex(Sha256Hash.wrap("4a9800c78110ea283ed15d2e53dd79401eff2313771a2ab114ab0b3b6617a718"), 0));
+
+        SilentPaymentUtils.computeOutputAddresses(silentPayments, summedPrivateKey, outpoints);
+        Assertions.assertEquals(3, silentPayments.size());
+        Assertions.assertEquals("Output 0", silentPayments.getFirst().getLabel());
+        Assertions.assertEquals("1bffa10fdaa2502c2f0c9285fe0af19a50f8515e3b6dfbf56de850d999014400", Utils.bytesToHex(silentPayments.getFirst().getAddress().getData()));
+        Assertions.assertEquals("Output 1", silentPayments.get(1).getLabel());
+        Assertions.assertEquals("884da6708c82b9b56c98bd3be6e5f53894bb1bfd90bfacf894025570f6bd5305", Utils.bytesToHex(silentPayments.get(1).getAddress().getData()));
+        Assertions.assertEquals("Output 2", silentPayments.getLast().getLabel());
+        Assertions.assertEquals("d291d339280e0c86e2c708a591f8e8e2f892d12a7cfe8510b667799b71131c86", Utils.bytesToHex(silentPayments.getLast().getAddress().getData()));
+    }
+
     // BIP352 key sum tests.
 
     @Test
@@ -1118,6 +1147,28 @@ public class SilentPaymentUtilsTest {
     }
 
     @Test
+    public void testVerifyRejectsPartiallyResolvedOutputs() throws Exception {
+        Wallet wallet = buildVerifyWallet();
+        WalletNode receiveNode = primeReceiveNode(wallet, 0);
+        PSBT psbt = buildVerifySendingPsbt(receiveNode, 2);
+
+        Map<PSBTInput, WalletNode> signingNodes = wallet.getSigningNodes(psbt);
+        wallet.computeSilentPaymentOutputs(psbt, signingNodes);
+        Script firstScript = psbt.getPsbtOutputs().getFirst().getScript();
+
+        //A counterparty resolves the second output only, giving it the script of the first - the BIP-352 output index would otherwise restart at zero
+        psbt.getPsbtOutputs().getFirst().setScript(null);
+        psbt.getPsbtOutputs().get(1).setScript(firstScript);
+
+        InvalidSilentPaymentException ex = Assertions.assertThrows(InvalidSilentPaymentException.class,
+                () -> wallet.verifySilentPaymentScripts(psbt, signingNodes), "Partially resolved silent payment outputs must be rejected");
+        Assertions.assertTrue(ex.getMessage().contains("all resolved or all unresolved"));
+
+        Assertions.assertThrows(InvalidSilentPaymentException.class, () -> wallet.computeSilentPaymentOutputs(psbt, signingNodes),
+                "Computing the remaining outputs would give both outputs the same script");
+    }
+
+    @Test
     public void testComputeRejectsInjectedSpInfo() throws Exception {
         Wallet wallet = buildVerifyWallet();
         WalletNode receiveNode = primeReceiveNode(wallet, 0);
@@ -1132,6 +1183,42 @@ public class SilentPaymentUtilsTest {
         Assertions.assertThrows(InvalidSilentPaymentException.class, () -> wallet.computeSilentPaymentOutputs(psbt, signingNodes),
                 "Injected PSBT_OUT_SP_V0_INFO without valid BIP-375 proofs must abort signing");
         Assertions.assertArrayEquals(baitScript.getProgram(), psbt.getPsbtOutputs().get(0).getScript().getProgram(),
+                "Visible output script must not be mutated when SP metadata fails verification");
+    }
+
+    @Test
+    public void testVerifyRejectsStrippedProofsForFinalizingWallet() throws Exception {
+        Wallet wallet = buildVerifyWallet();
+        WalletNode receiveNode = primeReceiveNode(wallet, 0);
+        PSBT psbt = buildVerifySendingPsbt(receiveNode);
+
+        Map<PSBTInput, WalletNode> signingNodes = wallet.getSigningNodes(psbt);
+        wallet.computeSilentPaymentOutputs(psbt, signingNodes);
+        wallet.sign(signingNodes);
+
+        psbt.getSilentPaymentsEcdhShares().clear();
+        psbt.getSilentPaymentsDLEQProofs().clear();
+
+        Assertions.assertTrue(wallet.verifySilentPaymentOutputs(psbt).isEmpty(), "Stripped BIP-375 metadata must not be learned as a verified silent payment");
+        //A wallet derived from the signed PSBT has no keys to verify against, so it must not learn the claimed addresses either
+        Wallet finalizingWallet = new FinalizingPSBTWallet(psbt);
+        Assertions.assertTrue(finalizingWallet.verifySilentPaymentOutputs(psbt).isEmpty(), "A wallet derived from a signed PSBT cannot verify its silent payment outputs");
+    }
+
+    @Test
+    public void testComputeRejectsInjectedNonAddressScript() throws Exception {
+        Wallet wallet = buildVerifyWallet();
+        WalletNode receiveNode = primeReceiveNode(wallet, 0);
+        PSBT psbt = buildVerifySendingPsbt(receiveNode);
+
+        //A script that does not parse as an address is still a resolved script, and must be proven rather than replaced by the computed one
+        Script baitScript = new Script(Utils.hexToBytes("6a0568656c6c6f"));
+        psbt.getPsbtOutputs().getFirst().setScript(baitScript);
+
+        Map<PSBTInput, WalletNode> signingNodes = wallet.getSigningNodes(psbt);
+        Assertions.assertThrows(InvalidSilentPaymentException.class, () -> wallet.computeSilentPaymentOutputs(psbt, signingNodes),
+                "Injected PSBT_OUT_SP_V0_INFO without valid BIP-375 proofs must abort signing");
+        Assertions.assertArrayEquals(baitScript.getProgram(), psbt.getPsbtOutputs().getFirst().getScript().getProgram(),
                 "Visible output script must not be mutated when SP metadata fails verification");
     }
 
@@ -1172,16 +1259,24 @@ public class SilentPaymentUtilsTest {
     }
 
     private static PSBT buildVerifySendingPsbt(WalletNode receiveNode) {
+        return buildVerifySendingPsbt(receiveNode, 1);
+    }
+
+    private static PSBT buildVerifySendingPsbt(WalletNode receiveNode, int silentPaymentOutputs) {
         Script inputScript = receiveNode.getOutputScript();
 
         Transaction tx = new Transaction();
         tx.setVersion(2);
         tx.addInput(Sha256Hash.wrap("0000000000000000000000000000000000000000000000000000000000000001"), 0, new Script(new byte[0]));
-        tx.addOutput(VERIFY_OUTPUT_VALUE, new Script(new byte[0]));
+        for(int i = 0; i < silentPaymentOutputs; i++) {
+            tx.addOutput(VERIFY_OUTPUT_VALUE, new Script(new byte[0]));
+        }
 
         PSBT psbt = new PSBT(tx);
         psbt.getPsbtInputs().get(0).setWitnessUtxo(new TransactionOutput(null, VERIFY_INPUT_VALUE, inputScript));
-        psbt.getPsbtOutputs().get(0).setSilentPaymentAddress(SilentPaymentAddress.from(VERIFY_TEST_SP_ADDRESS));
+        for(int i = 0; i < silentPaymentOutputs; i++) {
+            psbt.getPsbtOutputs().get(i).setSilentPaymentAddress(SilentPaymentAddress.from(VERIFY_TEST_SP_ADDRESS));
+        }
 
         return psbt;
     }

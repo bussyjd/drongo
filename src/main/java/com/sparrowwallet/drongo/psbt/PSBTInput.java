@@ -169,16 +169,19 @@ public class PSBTInput {
                     }
                     this.nonWitnessUtxo = nonWitnessTx;
                     log.debug("Found input non witness utxo with txid: " + nonWitnessTx.getTxId() + " version " + nonWitnessTx.getVersion() + " size " + nonWitnessTx.getMessageSize() + " locktime " + nonWitnessTx.getLocktime());
-                    for(TransactionInput input: nonWitnessTx.getInputs()) {
+                    for(TransactionInput input : nonWitnessTx.getInputs()) {
                         log.debug(" Transaction input references txid: " + input.getOutpoint().getHash() + " vout " + input.getOutpoint().getIndex() + " with script " + input.getScriptSig());
                     }
-                    for(TransactionOutput output: nonWitnessTx.getOutputs()) {
+                    for(TransactionOutput output : nonWitnessTx.getOutputs()) {
                         log.debug(" Transaction output value: " + output.getValue() + (output.getScript().getToAddress() != null ? " to address " + output.getScript().getToAddress() : "") + " with script hex " + Utils.bytesToHex(output.getScript().getProgram()) + " to script " + output.getScript());
                     }
                     break;
                 case PSBT_IN_WITNESS_UTXO:
                     entry.checkOneByteKey();
                     TransactionOutput witnessTxOutput = new TransactionOutput(null, entry.getData(), 0);
+                    if(witnessTxOutput.getValue() < 0 || witnessTxOutput.getValue() > Transaction.MAX_SATOSHIS) {
+                        throw new PSBTParseException("Witness UTXO amount is out of range: " + witnessTxOutput.getValue());
+                    }
                     if(!P2SH.isScriptType(witnessTxOutput.getScript()) && !P2WPKH.isScriptType(witnessTxOutput.getScript()) && !P2WSH.isScriptType(witnessTxOutput.getScript()) && !P2TR.isScriptType(witnessTxOutput.getScript()) && !P2MR.isScriptType(witnessTxOutput.getScript())) {
                         throw new PSBTParseException("Witness UTXO provided for non-witness or unknown input");
                     }
@@ -361,6 +364,7 @@ public class PSBTInput {
                     log.debug("Found input silent payments tweak");
                     break;
                 case PSBT_IN_PROPRIETARY:
+                    entry.checkOneBytePlusKeyData();
                     this.proprietary.put(Utils.bytesToHex(entry.getKeyData()), Utils.bytesToHex(entry.getData()));
                     log.debug("Found proprietary input " + Utils.bytesToHex(entry.getKeyData()) + ": " + Utils.bytesToHex(entry.getData()));
                     break;
@@ -1114,6 +1118,10 @@ public class PSBTInput {
     }
 
     void verifySigHash() throws PSBTSignatureException {
+        verifySigHash(sigHash);
+    }
+
+    void verifySigHash(SigHash sigHash) throws PSBTSignatureException {
         if(sigHash == null || sigHash == SigHash.ALL || sigHash == SigHash.DEFAULT) {
             return;
         }
@@ -1174,16 +1182,89 @@ public class PSBTInput {
         return false;
     }
 
+    Collection<TransactionSignature> verifyFinalizedSignatures() throws PSBTSignatureException {
+        if(!isFinalized()) {
+            throw new PSBTSignatureException("Input " + index + " is not finalized by the provided PSBT");
+        }
+
+        if(getUtxo() == null) {
+            throw new PSBTSignatureException("Input " + index + " is finalized, but provides no UTXO to verify its signatures against");
+        }
+
+        //Check the script the finalized fields carry, since that is the one a copy applies. Where this input already holds its own, getSigningScript() prefers that
+        //one and verifyUtxo() has matched it to the same hash at parse time, so the two cannot differ and either can supply the keys the signatures are verified against.
+        Script utxoScript = getUtxo().getScript();
+        if(P2SH.isScriptType(utxoScript)) {
+            Script nestedRedeemScript = getFinalScriptSig() != null ? getFinalScriptSig().getFirstNestedScript() : getRedeemScript();
+            if(nestedRedeemScript == null || !Arrays.equals(Utils.sha256hash160(nestedRedeemScript.getProgram()), utxoScript.getPubKeyHash())) {
+                throw new PSBTSignatureException("Input " + index + " is not finalized with the redeem script its UTXO commits to, so its signatures cannot be verified");
+            }
+            utxoScript = nestedRedeemScript;
+        }
+        if(P2WSH.isScriptType(utxoScript)) {
+            Script nestedWitnessScript = getFinalScriptWitness() != null ? getFinalScriptWitness().getWitnessScript() : getWitnessScript();
+            if(nestedWitnessScript == null || !Arrays.equals(Sha256Hash.hash(nestedWitnessScript.getProgram()), utxoScript.getPubKeyHash())) {
+                throw new PSBTSignatureException("Input " + index + " is not finalized with the witness script its UTXO commits to, so its signatures cannot be verified");
+            }
+        }
+
+        Script signingScript = getSigningScript();
+        if(signingScript == null) {
+            throw new PSBTSignatureException("Input " + index + " is finalized, but its signing script is not known so its signatures cannot be verified");
+        }
+
+        int requiredSignatures;
+        try {
+            requiredSignatures = signingScript.getNumRequiredSignatures();
+        } catch(NonStandardScriptException e) {
+            throw new PSBTSignatureException("Input " + index + " is finalized with a nonstandard signing script that cannot be verified: " + signingScript);
+        }
+
+        Map<ECKey, TransactionSignature> signingKeys = getSigningKeys(getFinalizedCandidateKeys(signingScript));
+        if(signingKeys.size() < requiredSignatures) {
+            throw new PSBTSignatureException("Input " + index + " provides " + signingKeys.size() + " valid signature(s) in its finalized scriptSig or witness, but " + requiredSignatures
+                    + " are required to spend it");
+        }
+
+        return signingKeys.values();
+    }
+
+    private Set<ECKey> getFinalizedCandidateKeys(Script signingScript) {
+        Set<ECKey> candidateKeys = new LinkedHashSet<>(getDerivedPublicKeys().keySet());
+
+        Script utxoScript = getUtxo().getScript();
+        if(P2TR.isScriptType(utxoScript)) {
+            candidateKeys.add(P2TR.getPublicKeyFromScript(utxoScript));
+        } else if(MULTISIG.isScriptType(signingScript)) {
+            candidateKeys.addAll(Arrays.asList(MULTISIG.getPublicKeysFromScript(signingScript)));
+        } else if(P2PK.isScriptType(signingScript)) {
+            candidateKeys.add(P2PK.getPublicKeyFromScript(signingScript));
+        } else if(P2PKH.isScriptType(signingScript)) {
+            //A single sig script commits to the hash of the spending key only, so take the candidate key from the finalized scriptSig or witness itself
+            byte[] pubKeyHash = signingScript.getPubKeyHash();
+            List<ScriptChunk> chunks = getFinalScriptWitness() != null ? getFinalScriptWitness().asScriptChunks() : getFinalScriptSig().getChunks();
+            for(ScriptChunk chunk : chunks) {
+                if(chunk.isPubKey() && Arrays.equals(pubKeyHash, Utils.sha256hash160(chunk.getPubKey().getPubKey()))) {
+                    candidateKeys.add(chunk.getPubKey());
+                }
+            }
+        }
+
+        return candidateKeys;
+    }
+
     public Map<ECKey, TransactionSignature> getSigningKeys(Set<ECKey> availableKeys) {
         Collection<TransactionSignature> signatures = getSignatures();
         Script signingScript = getSigningScript();
 
         Map<ECKey, TransactionSignature> signingKeys = new LinkedHashMap<>();
         if(signingScript != null) {
-            Sha256Hash hash = getHashForSignature(signingScript, getSigHash() == null ? getDefaultSigHash() : getSigHash());
+            Map<Byte, Sha256Hash> sigHashes = new HashMap<>();
 
             for(ECKey sigPublicKey : availableKeys) {
                 for(TransactionSignature signature : signatures) {
+                    Sha256Hash hash = sigHashes.computeIfAbsent(signature.sighashFlags, sigHashType -> getHashForSignature(signingScript, sigHashType));
+
                     if(sigPublicKey.verify(hash, signature)) {
                         signingKeys.put(sigPublicKey, signature);
                     }
@@ -1297,17 +1378,21 @@ public class PSBTInput {
     }
 
     private Sha256Hash getHashForSignature(Script connectedScript, SigHash localSigHash) {
+        return getHashForSignature(connectedScript, localSigHash.value);
+    }
+
+    private Sha256Hash getHashForSignature(Script connectedScript, byte sigHashType) {
         Sha256Hash hash;
 
         ScriptType scriptType = getScriptType();
         if(scriptType == ScriptType.P2TR) {
             List<TransactionOutput> spentUtxos = psbt.getPsbtInputs().stream().map(PSBTInput::getUtxo).collect(Collectors.toList());
-            hash = psbt.getTransaction().hashForTaprootSignature(spentUtxos, index, !P2TR.isScriptType(connectedScript), connectedScript, localSigHash, null);
+            hash = psbt.getTransaction().hashForTaprootSignature(spentUtxos, index, !P2TR.isScriptType(connectedScript), connectedScript, sigHashType, null);
         } else if(Arrays.asList(WITNESS_TYPES).contains(scriptType)) {
             long prevValue = getUtxo().getValue();
-            hash = psbt.getTransaction().hashForWitnessSignature(index, connectedScript, prevValue, localSigHash);
+            hash = psbt.getTransaction().hashForWitnessSignature(index, connectedScript.getProgram(), prevValue, sigHashType);
         } else {
-            hash = psbt.getTransaction().hashForLegacySignature(index, connectedScript, localSigHash);
+            hash = psbt.getTransaction().hashForLegacySignature(index, connectedScript.getProgram(), sigHashType);
         }
 
         return hash;

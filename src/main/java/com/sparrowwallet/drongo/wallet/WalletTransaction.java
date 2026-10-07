@@ -101,11 +101,20 @@ public class WalletTransaction {
     }
 
     public double getFeeRate() {
-        if(wallet != null && wallet.getPolicyType() == PolicyType.SINGLE_MLDSA) {
-            //BTQ transactions weigh at witness scale 16; the Transaction class computes scale-4 vsize
-            return (double)fee / wallet.getVirtualSize(transaction);
+        return (double)fee / getVirtualSize();
+    }
+
+    public double getVirtualSize() {
+        if(wallet != null) {
+            //Bitcoin Quantum transactions weigh at witness scale 16, which only the wallet knows to apply
+            return wallet.getVirtualSize(transaction, outputs);
         }
-        return (double)fee / transaction.getVirtualSize();
+        return getVirtualSize(transaction, outputs);
+    }
+
+    static double getVirtualSize(Transaction transaction, List<Output> outputs) {
+        long unresolvedSilentPaymentOutputs = outputs.stream().filter(output -> output instanceof SilentPaymentOutput && output.getTransactionOutput().getScriptBytes().length == 0).count();
+        return transaction.getVirtualSize() + unresolvedSilentPaymentOutputs * SilentPayment.OUTPUT_SCRIPT_LENGTH;
     }
 
     public long getTotal() {
@@ -126,6 +135,7 @@ public class WalletTransaction {
 
     /**
      * Fee percentage matches the Coldcard implementation of total fee as a percentage of total value out
+     *
      * @return the fee percentage
      */
     public double getFeePercentage() {
