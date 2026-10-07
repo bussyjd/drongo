@@ -6,6 +6,7 @@ import com.sparrowwallet.drongo.address.P2MRAddress;
 import java.io.ByteArrayOutputStream;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
+import java.util.Arrays;
 import java.util.Objects;
 
 import static com.sparrowwallet.drongo.protocol.ScriptOpCodes.OP_2;
@@ -41,6 +42,18 @@ public final class P2MR {
         script.writeBytes(publicKey);
         script.write(OP_CHECKSIGDILITHIUM);
         return script.toByteArray();
+    }
+
+    /**
+     * The ML-DSA public key of a canonical single-key leaf script, or null when the script is anything else.
+     * Only the exact {@link #singleKeyLeafScript} encoding is accepted, so a non-canonical push of the same key yields null.
+     */
+    public static byte[] publicKeyFromSingleKeyLeafScript(byte[] leafScript) {
+        if(leafScript == null || leafScript.length != Mldsa44.PUBLIC_KEY_BYTES + 4) {
+            return null;
+        }
+        byte[] publicKey = Arrays.copyOfRange(leafScript, 3, 3 + Mldsa44.PUBLIC_KEY_BYTES);
+        return Arrays.equals(singleKeyLeafScript(publicKey), leafScript) ? publicKey : null;
     }
 
     /** The BIP341 TapLeaf hash {@code tagged_hash("TapLeaf", leafVersion || compactSize(len) || script)}. */

@@ -3,6 +3,7 @@ package com.sparrowwallet.drongo.psbt;
 import com.sparrowwallet.drongo.ExtendedKey;
 import com.sparrowwallet.drongo.KeyDerivation;
 import com.sparrowwallet.drongo.Utils;
+import com.sparrowwallet.drongo.btq.BtqPsbtSigner;
 import com.sparrowwallet.drongo.crypto.ECKey;
 import com.sparrowwallet.drongo.policy.PolicyType;
 import com.sparrowwallet.drongo.protocol.*;
@@ -1123,6 +1124,12 @@ public class PSBT {
             //The non final fields are retained here, so the finalized signatures are verified against the signing scripts and keys already provided
             verificationInput.setFinalScriptSig(finalizedInput.getFinalScriptSig());
             verificationInput.setFinalScriptWitness(finalizedInput.getFinalScriptWitness());
+            TransactionOutput utxo = verificationInput.getUtxo();
+            if(utxo != null && ScriptType.P2MR.isScriptType(utxo.getScript())) {
+                //A Bitcoin Quantum P2MR spend carries an ML-DSA signature, which the ECDSA and Schnorr verification below cannot check
+                BtqPsbtSigner.verifyFinalizedInput(verificationCopy, i);
+                continue;
+            }
             verifyFinalizedSigHashes(verificationInput, verificationInput.verifyFinalizedSignatures());
         }
     }

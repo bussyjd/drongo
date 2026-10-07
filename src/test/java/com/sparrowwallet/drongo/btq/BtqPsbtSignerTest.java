@@ -7,6 +7,7 @@ import com.sparrowwallet.drongo.protocol.TransactionOutput;
 import com.sparrowwallet.drongo.protocol.TransactionWitness;
 import com.sparrowwallet.drongo.psbt.PSBT;
 import com.sparrowwallet.drongo.psbt.PSBTInput;
+import com.sparrowwallet.drongo.psbt.PSBTSignatureException;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Test;
 
@@ -114,5 +115,97 @@ public class BtqPsbtSignerTest {
         byte[] wrongSeed = new byte[Mldsa44.SEED_BYTES];
         Arrays.fill(wrongSeed, (byte)0x7f);
         Assertions.assertThrows(IllegalStateException.class, () -> BtqPsbtSigner.sign(psbt, Map.of(0, wrongSeed)));
+    }
+
+    private static byte[] testSeed(int offset) {
+        byte[] seed = new byte[Mldsa44.SEED_BYTES];
+        for(int i = 0; i < seed.length; i++) {
+            seed[i] = (byte)(offset + i);
+        }
+        return seed;
+    }
+
+    /** A copy of the fixed PSBT for the seed's key, signed and finalized as a co-signer or Core would return it. */
+    private static PSBT finalizedPsbt(byte[] seed) {
+        PSBT psbt = buildFixedPsbt(Mldsa44.publicKeyFromSeed(seed));
+        BtqPsbtSigner.sign(psbt, Map.of(0, seed));
+        BtqPsbtSigner.finaliseInputs(psbt);
+        return psbt;
+    }
+
+    private static void replaceWitness(PSBT psbt, byte[] signature, byte[] leafScript, byte[] controlBlock) {
+        psbt.getPsbtInputs().get(0).setFinalScriptWitness(new TransactionWitness(psbt.getTransaction(), List.of(signature, leafScript, controlBlock)));
+    }
+
+    @Test
+    public void testVerifyFinalizedSignaturesAcceptsSignedP2mr() throws Exception {
+        byte[] seed = testSeed(0x30);
+        PSBT open = buildFixedPsbt(Mldsa44.publicKeyFromSeed(seed));
+        open.verifyFinalizedSignatures(finalizedPsbt(seed));
+    }
+
+    @Test
+    public void testVerifyFinalizedSignaturesRejectsTamperedSignature() {
+        byte[] seed = testSeed(0x30);
+        PSBT open = buildFixedPsbt(Mldsa44.publicKeyFromSeed(seed));
+        PSBT finalized = finalizedPsbt(seed);
+        List<byte[]> pushes = finalized.getPsbtInputs().get(0).getFinalScriptWitness().getPushes();
+        byte[] signature = pushes.get(0).clone();
+        signature[100] ^= 0x01;
+        replaceWitness(finalized, signature, pushes.get(1), pushes.get(2));
+        PSBTSignatureException e = Assertions.assertThrows(PSBTSignatureException.class, () -> open.verifyFinalizedSignatures(finalized));
+        Assertions.assertTrue(e.getMessage().contains("does not verify"), e.getMessage());
+    }
+
+    @Test
+    public void testVerifyFinalizedSignaturesRejectsWrongSighashType() {
+        byte[] seed = testSeed(0x30);
+        PSBT open = buildFixedPsbt(Mldsa44.publicKeyFromSeed(seed));
+        PSBT finalized = finalizedPsbt(seed);
+        List<byte[]> pushes = finalized.getPsbtInputs().get(0).getFinalScriptWitness().getPushes();
+        byte[] signature = pushes.get(0).clone();
+        signature[Mldsa44.SIGNATURE_BYTES] = 0x03; //SIGHASH_SINGLE
+        replaceWitness(finalized, signature, pushes.get(1), pushes.get(2));
+        Assertions.assertThrows(PSBTSignatureException.class, () -> open.verifyFinalizedSignatures(finalized));
+    }
+
+    @Test
+    public void testVerifyFinalizedSignaturesRejectsLeafTheUtxoDoesNotCommitTo() {
+        //A valid signature by another key, presented with that key's leaf, must not be copied over this input's UTXO
+        byte[] seed = testSeed(0x30);
+        byte[] otherSeed = testSeed(0x50);
+        PSBT open = buildFixedPsbt(Mldsa44.publicKeyFromSeed(seed));
+        PSBT finalized = finalizedPsbt(seed);
+        byte[] otherLeaf = P2MR.singleKeyLeafScript(Mldsa44.publicKeyFromSeed(otherSeed));
+        byte[] otherSignature = Mldsa44.signTransactionHash(otherSeed, BtqPsbtSigner.sighash(open, 0, otherLeaf));
+        replaceWitness(finalized, otherSignature, otherLeaf, P2MR.singleLeafControlBlock());
+        PSBTSignatureException e = Assertions.assertThrows(PSBTSignatureException.class, () -> open.verifyFinalizedSignatures(finalized));
+        Assertions.assertTrue(e.getMessage().contains("does not commit"), e.getMessage());
+    }
+
+    @Test
+    public void testVerifyFinalizedSignaturesRejectsMultiLeafControlBlock() {
+        byte[] seed = testSeed(0x30);
+        PSBT open = buildFixedPsbt(Mldsa44.publicKeyFromSeed(seed));
+        PSBT finalized = finalizedPsbt(seed);
+        List<byte[]> pushes = finalized.getPsbtInputs().get(0).getFinalScriptWitness().getPushes();
+        byte[] controlBlock = new byte[33];
+        controlBlock[0] = P2MR.singleLeafControlBlock()[0];
+        replaceWitness(finalized, pushes.get(0), pushes.get(1), controlBlock);
+        Assertions.assertThrows(PSBTSignatureException.class, () -> open.verifyFinalizedSignatures(finalized));
+    }
+
+    @Test
+    public void testVerifyFinalizedSignaturesRejectsNonCanonicalLeaf() {
+        byte[] seed = testSeed(0x30);
+        PSBT open = buildFixedPsbt(Mldsa44.publicKeyFromSeed(seed));
+        PSBT finalized = finalizedPsbt(seed);
+        List<byte[]> pushes = finalized.getPsbtInputs().get(0).getFinalScriptWitness().getPushes();
+        byte[] leaf = pushes.get(1).clone();
+        leaf[leaf.length - 1] = (byte)0xac; //OP_CHECKSIG in place of OP_CHECKSIGDILITHIUM
+        replaceWitness(finalized, pushes.get(0), leaf, pushes.get(2));
+        Assertions.assertThrows(PSBTSignatureException.class, () -> open.verifyFinalizedSignatures(finalized));
+        Assertions.assertNull(P2MR.publicKeyFromSingleKeyLeafScript(leaf));
+        Assertions.assertArrayEquals(Mldsa44.publicKeyFromSeed(seed), P2MR.publicKeyFromSingleKeyLeafScript(pushes.get(1)));
     }
 }

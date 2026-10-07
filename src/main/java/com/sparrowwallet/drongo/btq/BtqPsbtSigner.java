@@ -9,6 +9,7 @@ import com.sparrowwallet.drongo.protocol.TransactionWitness;
 import com.sparrowwallet.drongo.psbt.PSBT;
 import com.sparrowwallet.drongo.psbt.PSBTInput;
 import com.sparrowwallet.drongo.psbt.PSBTProofException;
+import com.sparrowwallet.drongo.psbt.PSBTSignatureException;
 
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -37,7 +38,11 @@ public final class BtqPsbtSigner {
         if(leafScript == null) {
             throw new IllegalStateException("input " + inputIndex + " is not a P2MR input (no leaf script)");
         }
+        return sighash(psbt, inputIndex, leafScript);
+    }
 
+    /** The P2MR script-path (BIP341, SIGHASH_ALL) sighash for the given input spent through the given leaf script. */
+    static byte[] sighash(PSBT psbt, int inputIndex, byte[] leafScript) {
         List<TransactionOutput> spentOutputs = new ArrayList<>(psbt.getPsbtInputs().size());
         for(int i = 0; i < psbt.getPsbtInputs().size(); i++) {
             TransactionOutput witnessUtxo = psbt.getPsbtInputs().get(i).getWitnessUtxo();
@@ -49,6 +54,57 @@ public final class BtqPsbtSigner {
 
         Sha256Hash hash = psbt.getTransaction().hashForTaprootSignature(spentOutputs, inputIndex, true, new Script(leafScript), SigHash.ALL, null);
         return hash.getBytes();
+    }
+
+    /**
+     * Verify the finalized witness of a P2MR input against the transaction this PSBT represents, before its fields are copied
+     * into an open transaction. Only the single-key, single-leaf tree this wallet builds can be verified; any other witness,
+     * tree shape or leaf template fails closed rather than being copied unchecked.
+     *
+     * @throws PSBTSignatureException if the witness does not commit to the input's UTXO or its ML-DSA signature does not verify
+     */
+    public static void verifyFinalizedInput(PSBT psbt, int inputIndex) throws PSBTSignatureException {
+        PSBTInput input = psbt.getPsbtInputs().get(inputIndex);
+        TransactionOutput witnessUtxo = input.getWitnessUtxo();
+        if(witnessUtxo == null) {
+            throw new PSBTSignatureException("P2MR input " + inputIndex + " provides no witness UTXO to verify its signature against");
+        }
+        if(input.getFinalScriptSig() != null && input.getFinalScriptSig().getProgram().length > 0) {
+            throw new PSBTSignatureException("P2MR input " + inputIndex + " is finalized with a non-empty scriptSig");
+        }
+        TransactionWitness witness = input.getFinalScriptWitness();
+        if(witness == null || witness.getPushCount() != 3) {
+            throw new PSBTSignatureException("P2MR input " + inputIndex + " is not finalized with a [signature, leaf script, control block] witness");
+        }
+
+        List<byte[]> pushes = witness.getPushes();
+        byte[] signature = pushes.get(0);
+        byte[] leafScript = pushes.get(1);
+        byte[] controlBlock = pushes.get(2);
+
+        if(!Arrays.equals(controlBlock, P2MR.singleLeafControlBlock())) {
+            throw new PSBTSignatureException("P2MR input " + inputIndex + " is finalized through a multi-leaf tree, which this wallet cannot verify");
+        }
+        byte[] publicKey = P2MR.publicKeyFromSingleKeyLeafScript(leafScript);
+        if(publicKey == null) {
+            throw new PSBTSignatureException("P2MR input " + inputIndex + " is finalized with a leaf script that is not a single-key ML-DSA leaf");
+        }
+        if(!Arrays.equals(P2MR.outputScript(P2MR.tapLeafHash(leafScript)), witnessUtxo.getScript().getProgram())) {
+            throw new PSBTSignatureException("P2MR input " + inputIndex + " is finalized with a leaf that its UTXO does not commit to");
+        }
+        if(signature.length != Mldsa44.TRANSACTION_SIGNATURE_BYTES) {
+            throw new PSBTSignatureException("P2MR input " + inputIndex + " is finalized with a signature of " + signature.length + " bytes");
+        }
+
+        byte[] sighash;
+        try {
+            sighash = sighash(psbt, inputIndex, leafScript);
+        } catch(IllegalStateException e) {
+            throw new PSBTSignatureException("P2MR input " + inputIndex + " cannot be verified: " + e.getMessage());
+        }
+        if(!Mldsa44.verifyTransactionHash(publicKey, sighash, signature)) {
+            throw new PSBTSignatureException("P2MR input " + inputIndex + " is finalized with an ML-DSA signature that does not verify");
+        }
     }
 
     /**
